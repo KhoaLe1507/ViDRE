@@ -117,13 +117,10 @@ as a fully trained video retrieval model.
 The main metrics are:
 
 - Keyframe Recall@1, Recall@5, Recall@10
-- Video Recall@1, Recall@5, Recall@10
 - Mean online latency per query
 
 A predicted keyframe is counted as correct when it belongs to the ground-truth
-video and its timestamp falls inside the ground-truth temporal span. Video
-recall ignores timestamp and checks only whether the ground-truth video appears
-in the top-k results.
+video and its timestamp falls inside the ground-truth temporal span.
 
 ## Key Findings
 
@@ -151,9 +148,9 @@ On the original action-query setting, video-first aggregation and
 query-conditioned reranking improved the video retrieval signal, but the task
 remained challenging due to underspecified action labels.
 
-| Setting | Queries | Keyframe R@1 | Keyframe R@5 | Keyframe R@10 | Video R@1 | Video R@5 | Video R@10 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| BEiT-3 query-conditioned video-first prototype | 1,000 | 0.027 | 0.086 | 0.125 | 0.045 | 0.132 | 0.207 |
+| Setting | Queries | Keyframe R@1 | Keyframe R@5 | Keyframe R@10 |
+| --- | ---: | ---: | ---: | ---: |
+| BEiT-3 query-conditioned video-first prototype | 1,000 | 0.027 | 0.086 | 0.125 |
 
 ### 4. Visually grounded scene/moment queries are much easier to retrieve
 
@@ -162,9 +159,9 @@ quality increases sharply. This suggests that the original dense-captioning
 queries can be ambiguous for global retrieval, where many videos may match the
 same short action phrase but only one is labeled as ground truth.
 
-| Setting | Queries | Keyframe R@1 | Keyframe R@5 | Keyframe R@10 | Video R@1 | Video R@5 | Video R@10 | Latency |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| BEiT-3 query-conditioned video-first on scene/moment queries | 1,000 | 0.327 | 0.512 | 0.568 | 0.485 | 0.758 | 0.852 | 831 ms |
+| Setting | Queries | Keyframe R@1 | Keyframe R@5 | Keyframe R@10 | Latency |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BEiT-3 query-conditioned video-first on scene/moment queries | 1,000 | 0.327 | 0.512 | 0.568 | 831 ms |
 
 ## Repository Structure
 
