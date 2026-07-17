@@ -12,7 +12,7 @@ from src.online.branches.textual_branch import TextualQueryBranch
 from src.online.fusion import assign_ranks, weighted_rrf_fuse
 from src.online.latency import LatencyTracker
 from src.online.object_filter import apply_object_filter
-from src.schemas import SearchResponse
+from src.schemas import RetrievalCandidate, SearchResponse
 from src.storage.cockroach_client import CockroachClient
 from src.storage.zilliz_client import ZillizClient
 from src.utils.config import get_config_value, load_config
@@ -36,13 +36,14 @@ class SearchPipeline:
             "openclip_user_query_baseline",
             "beit3_user_query_baseline",
             "textual_query_baseline",
+            "beit3_video_mean_top3_baseline",
         }
         if self.mode not in supported_modes:
             raise ValueError(f"Unsupported online.mode={self.mode!r}. Expected one of {sorted(supported_modes)}.")
 
         if self.mode in {"full", "openclip_user_query_baseline", "textual_query_baseline"}:
             self.openclip = OpenCLIPH14Encoder(config).load()
-        if self.mode in {"full", "beit3_user_query_baseline", "textual_query_baseline"}:
+        if self.mode in {"full", "beit3_user_query_baseline", "textual_query_baseline", "beit3_video_mean_top3_baseline"}:
             self.beit3 = BEiT3Encoder(config).load()
         if self.mode == "full":
             self.gemini = GeminiClient(config)
@@ -59,6 +60,9 @@ class SearchPipeline:
         if self.mode == "textual_query_baseline":
             assert self.beit3 is not None and self.openclip is not None
             return self._search_textual_query(query, latency_mode=latency_mode, output_depth=output_depth)
+        if self.mode == "beit3_video_mean_top3_baseline":
+            assert self.beit3 is not None
+            return self._search_beit3_video_mean_top3(query, latency_mode=latency_mode, output_depth=output_depth)
 
         assert self.beit3 is not None and self.openclip is not None and self.gemini is not None and self.sd_generator is not None
         tracker = LatencyTracker()
@@ -202,6 +206,50 @@ class SearchPipeline:
             },
         )
 
+    def _search_beit3_video_mean_top3(
+        self,
+        query: str,
+        latency_mode: str,
+        output_depth: int | None = None,
+    ) -> SearchResponse:
+        assert self.beit3 is not None
+        tracker = LatencyTracker()
+        final_depth = output_depth or int(get_config_value(self.config, "retrieval.output_depth", 500))
+        global_depth = int(get_config_value(self.config, "video_aggregation.global_depth", 1000))
+        keyframes_per_video = int(get_config_value(self.config, "video_aggregation.keyframes_per_video", 1))
+        keyframes_per_video = max(1, keyframes_per_video)
+
+        with tracker.measure("beit3_video_mean_top3_branch"):
+            beit3_vector = self.beit3.encode_texts([query])[0]
+            global_results = self.zilliz.search(self.zilliz.beit3_field, beit3_vector, global_depth)
+            grouped = _group_candidates_by_video(global_results)
+            ranked_videos = sorted(
+                grouped.items(),
+                key=lambda item: (-_mean_top_k_score(item[1], k=3), item[0]),
+            )
+            final_results: List[RetrievalCandidate] = []
+            for _, candidates in ranked_videos:
+                final_results.extend(candidates[:keyframes_per_video])
+                if len(final_results) >= final_depth:
+                    break
+
+        return SearchResponse(
+            query=query,
+            results=assign_ranks(final_results[:final_depth]),
+            latency_ms=tracker.total_ms,
+            latency_breakdown_ms=tracker.breakdown_ms,
+            branch_debug={
+                "online_mode": self.mode,
+                "latency_mode": latency_mode,
+                "vector_field": self.zilliz.beit3_field,
+                "object_filter_enabled": False,
+                "global_depth": global_depth,
+                "keyframes_per_video": keyframes_per_video,
+                "video_score_strategy": "mean_top3_score",
+                "branches": ["beit3_video_mean_top3"],
+            },
+        )
+
     def _get_object_constraints(self, query: str, latency_mode: str) -> List[Dict[str, int]]:
         cache_version = self.config["project"]["config_version"]
         cache_key = query_cache_key(query, cache_version)
@@ -226,6 +274,18 @@ class SearchPipeline:
         return constraints
 
 
+def _group_candidates_by_video(candidates: List[RetrievalCandidate]) -> Dict[str, List[RetrievalCandidate]]:
+    grouped: Dict[str, List[RetrievalCandidate]] = {}
+    for candidate in candidates:
+        grouped.setdefault(candidate.video_id, []).append(candidate)
+    return grouped
+
+
+def _mean_top_k_score(candidates: List[RetrievalCandidate], k: int = 3) -> float:
+    scores = sorted((float(candidate.score) for candidate in candidates), reverse=True)[:k]
+    return sum(scores) / len(scores) if scores else float("-inf")
+
+
 def search_single_query(
     query: str,
     config_path: str | None = None,
@@ -240,7 +300,12 @@ def search_single_query(
         overrides["object_filter"] = {"enabled": False}
     if online_mode:
         overrides["online"] = {"mode": online_mode}
-        if online_mode in {"openclip_user_query_baseline", "beit3_user_query_baseline", "textual_query_baseline"}:
+        if online_mode in {
+            "openclip_user_query_baseline",
+            "beit3_user_query_baseline",
+            "textual_query_baseline",
+            "beit3_video_mean_top3_baseline",
+        }:
             overrides["object_filter"] = {"enabled": False}
     if baseline_openclip_only:
         overrides["online"] = {"mode": "openclip_user_query_baseline"}

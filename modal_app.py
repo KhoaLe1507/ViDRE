@@ -1202,6 +1202,8 @@ def run_online_evaluation(
     baseline_openclip_only: bool = False,
     require_verified_gt_video: bool = False,
     require_gt_span_keyframe: bool = False,
+    video_aggregation_global_depth: int | None = None,
+    video_aggregation_keyframes_per_video: int | None = None,
 ) -> Dict[str, Any]:
     _prepare_runtime()
     from src.eval.run_evaluation import run_online_evaluation as _run_online_evaluation
@@ -1221,6 +1223,8 @@ def run_online_evaluation(
         baseline_openclip_only=baseline_openclip_only,
         require_verified_gt_video=require_verified_gt_video,
         require_gt_span_keyframe=require_gt_span_keyframe,
+        video_aggregation_global_depth=video_aggregation_global_depth,
+        video_aggregation_keyframes_per_video=video_aggregation_keyframes_per_video,
     )
 
 
@@ -1311,6 +1315,40 @@ def run_textual_baseline_evaluation(
         online_mode="textual_query_baseline",
         require_verified_gt_video=require_verified_gt_video,
         require_gt_span_keyframe=require_gt_span_keyframe,
+    )
+
+
+@app.function(gpu="L4", cpu=4, memory=32768, timeout=21600, **function_kwargs)
+def run_video_aggregation_baseline_evaluation(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    output_dir: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    latency_mode: str | None = None,
+    require_verified_gt_video: bool = False,
+    require_gt_span_keyframe: bool = False,
+    global_depth: int = 1000,
+    keyframes_per_video: int = 1,
+) -> Dict[str, Any]:
+    _prepare_runtime()
+    from src.eval.run_evaluation import run_online_evaluation as _run_online_evaluation
+
+    config_path = _default_config_path(config_path)
+    dataset_path = dataset_path or ("/data/TimeLens-Bench/charades-timelens-query-samples.json" if modal is not None else None)
+    output_dir = output_dir or ("/data/outputs/eval" if modal is not None else None)
+    return _run_online_evaluation(
+        config_path=config_path,
+        dataset_path=dataset_path,
+        output_dir=output_dir,
+        limit=limit,
+        offset=offset,
+        latency_mode=latency_mode,
+        online_mode="beit3_video_mean_top3_baseline",
+        require_verified_gt_video=require_verified_gt_video,
+        require_gt_span_keyframe=require_gt_span_keyframe,
+        video_aggregation_global_depth=global_depth,
+        video_aggregation_keyframes_per_video=keyframes_per_video,
     )
 
 

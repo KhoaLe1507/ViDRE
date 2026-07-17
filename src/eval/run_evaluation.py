@@ -31,6 +31,8 @@ def run_online_evaluation(
     baseline_openclip_only: bool = False,
     require_verified_gt_video: bool = False,
     require_gt_span_keyframe: bool = False,
+    video_aggregation_global_depth: int | None = None,
+    video_aggregation_keyframes_per_video: int | None = None,
 ) -> Dict[str, Any]:
     setup_logging()
     overrides: Dict[str, Any] = {}
@@ -38,8 +40,20 @@ def run_online_evaluation(
         overrides["object_filter"] = {"enabled": False}
     if online_mode:
         overrides["online"] = {"mode": online_mode}
-        if online_mode in {"openclip_user_query_baseline", "beit3_user_query_baseline", "textual_query_baseline"}:
+        if online_mode in {
+            "openclip_user_query_baseline",
+            "beit3_user_query_baseline",
+            "textual_query_baseline",
+            "beit3_video_mean_top3_baseline",
+        }:
             overrides["object_filter"] = {"enabled": False}
+    video_aggregation_overrides: Dict[str, Any] = {}
+    if video_aggregation_global_depth is not None:
+        video_aggregation_overrides["global_depth"] = int(video_aggregation_global_depth)
+    if video_aggregation_keyframes_per_video is not None:
+        video_aggregation_overrides["keyframes_per_video"] = int(video_aggregation_keyframes_per_video)
+    if video_aggregation_overrides:
+        overrides["video_aggregation"] = video_aggregation_overrides
     if baseline_openclip_only:
         overrides["online"] = {"mode": "openclip_user_query_baseline"}
         overrides["object_filter"] = {"enabled": False}
@@ -152,6 +166,8 @@ def run_online_evaluation(
         "object_filter_enabled": bool(get_config_value(config, "object_filter.enabled", True)),
         "require_verified_gt_video": bool(require_verified_gt_video),
         "require_gt_span_keyframe": bool(require_gt_span_keyframe),
+        "video_aggregation_global_depth": get_config_value(config, "video_aggregation.global_depth"),
+        "video_aggregation_keyframes_per_video": get_config_value(config, "video_aggregation.keyframes_per_video"),
         "model_version": config["project"]["model_version"],
         "config_version": config["project"]["config_version"],
         "notes": _build_metrics_note(config),
@@ -288,6 +304,12 @@ def _build_metrics_note(config: Dict[str, Any]) -> str:
             "Baseline latency includes BEiT-3 and OpenCLIP H/14 text encoding, Zilliz vector search, and RRF fusion. "
             "It excludes Gemini, Stable Diffusion, Object Filter, UI and video rendering."
         )
+    if online_mode == "beit3_video_mean_top3_baseline":
+        return (
+            "Baseline latency includes BEiT-3 text encoding, Zilliz top-depth retrieval, video-level mean-top3 score "
+            "aggregation, and keyframe selection from ranked videos. It excludes OpenCLIP, Gemini, Stable Diffusion, "
+            "Object Filter, UI and video rendering."
+        )
     object_filter_enabled = bool(get_config_value(config, "object_filter.enabled", True))
     object_filter_note = "with Object Filter" if object_filter_enabled else "without Object Filter"
     return (
@@ -308,11 +330,19 @@ def main() -> None:
     parser.add_argument(
         "--online-mode",
         default=None,
-        choices=["full", "openclip_user_query_baseline", "beit3_user_query_baseline", "textual_query_baseline"],
+        choices=[
+            "full",
+            "openclip_user_query_baseline",
+            "beit3_user_query_baseline",
+            "textual_query_baseline",
+            "beit3_video_mean_top3_baseline",
+        ],
     )
     parser.add_argument("--baseline-openclip-only", action="store_true")
     parser.add_argument("--require-verified-gt-video", action="store_true")
     parser.add_argument("--require-gt-span-keyframe", action="store_true")
+    parser.add_argument("--video-aggregation-global-depth", type=int, default=None)
+    parser.add_argument("--video-aggregation-keyframes-per-video", type=int, default=None)
     args = parser.parse_args()
     result = run_online_evaluation(
         config_path=args.config,
@@ -326,6 +356,8 @@ def main() -> None:
         baseline_openclip_only=args.baseline_openclip_only,
         require_verified_gt_video=args.require_verified_gt_video,
         require_gt_span_keyframe=args.require_gt_span_keyframe,
+        video_aggregation_global_depth=args.video_aggregation_global_depth,
+        video_aggregation_keyframes_per_video=args.video_aggregation_keyframes_per_video,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
