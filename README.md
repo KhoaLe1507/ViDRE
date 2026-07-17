@@ -1,4 +1,4 @@
-# ViDRE: Text-to-Keyframe Video Retrieval Research Project
+# ViDRE: Action-Aware Text-to-Video and Keyframe Retrieval
 
 ViDRE is a research-oriented system for retrieving relevant video moments from
 natural language queries. Given a text query, the system searches a large video
