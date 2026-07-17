@@ -1,0 +1,144 @@
+project:
+  name: "vidre-text-to-keyframe"
+  dataset_name: "charades-timelens"
+  config_version: "v0.1.0-spec"
+  model_version: "v0.1.0-local-models"
+
+paths:
+  model_dir: "data/models"
+  dataset_query_samples: "data/TimeLens-Bench/charades-timelens-query-samples.json"
+  dataset_video_level: "data/TimeLens-Bench/charades-timelens.json"
+  video_dir: "data/TimeLens-Bench/videos/charades"
+  output_dir: "outputs"
+  sd_cache_dir: "outputs/cache/stable_diffusion"
+  local_proxy_dir: "outputs/shot_proxies"
+
+models:
+  beit3:
+    model_dir: "data/models/beit3-large-itc"
+    checkpoint: "beit3_large_itc_patch16_224.pth"
+    sentencepiece: "beit3.spm"
+    external_code_dir: "external/unilm/beit3"
+    input_size: 224
+    embedding_dim: 1024
+    device: "cuda"
+    dtype: "fp16"
+  openclip_h14:
+    model_dir: "data/models/openclip-dfn5b-vit-h-14"
+    model_name: "ViT-H-14-quickgelu"
+    pretrained: "local"
+    embedding_dim: 1024
+    device: "cuda"
+    dtype: "fp16"
+  transnetv2:
+    weights_dir: "data/models/transnetv2/transnetv2-weights"
+    external_code_dir: "external/TransNetV2/inference"
+  codetr:
+    checkpoint: "data/models/codetr-vit-large-coco/pytorch_model.pth"
+    config: "external/Co-DETR/projects/configs/co_dino_vit/co_dino_5scale_vit_large_coco.py"
+    external_code_dir: "external/Co-DETR"
+    dataset_classes: "COCO"
+    confidence_threshold: 0.35
+    nms_enabled: true
+    count_rule: "count_valid_detections_after_threshold_and_nms"
+    device: "cuda:0"
+  stable_diffusion:
+    model_dir: "data/models/sdxl-base-1.0-diffusers-fp16"
+    num_images: 5
+    seeds: [10, 100, 1000, 10000, 100000]
+    guidance_scale: 7.0
+    num_inference_steps: 30
+    height: 512
+    width: 512
+    dtype: "fp16"
+    device: "cuda"
+    negative_prompt: "cartoon, anime, painting, unrealistic, extra people, extra objects, wrong action, text overlay, watermark, logo, distorted hands, distorted face"
+  gemini:
+    model_env: "GEMINI_MODEL"
+    api_key_env: "GEMINI_API_KEY"
+    max_retries: 2
+
+transnetv2:
+  shot_boundary_threshold: 0.5
+  min_shot_duration_sec: 1.0
+  merge_short_shots: true
+  timestamp_rounding: "keep_float_seconds_and_frame_index"
+
+keyframe_selection:
+  sample_stride_frames: 10
+  distance_metric: "cosine_distance"
+  normalize_embedding: "l2"
+  threshold_prev_candidate: 0.075
+  threshold_last_keyframe: 0.10
+
+shot_proxy:
+  codec: "h264"
+  crf: 28
+  preset: "veryfast"
+  max_height: 720
+  keep_audio: false
+  container: "mp4"
+
+offline:
+  resume: true
+  delete_raw_after_verified: false
+  decode_workers_per_container: 4
+  zilliz_insert_batch_size: 256
+  beit3_image_batch_size: 16
+  openclip_image_batch_size: 32
+  codetr_batch_size: 2
+
+retrieval:
+  depth_per_model: 200
+  branch_depth: 200
+  final_depth: 500
+  output_depth: 500
+
+rrf:
+  rrf_k: 60
+
+weighted_rrf:
+  rrf_k: 60
+  branch_weights:
+    textual_query: 1.0
+    llm_query_expansion: 1.0
+    stable_diffusion: 0.5
+  post_fusion_depth: 500
+
+object_filter:
+  enabled: true
+  backfill: false
+
+cache:
+  enabled: true
+  cache_version_from_config: true
+
+evaluation:
+  latency_mode: "cache_miss_full_online"
+  output_dir: "outputs/eval"
+  top_k_values: [1, 5, 10]
+
+online:
+  mode: "full"
+
+zilliz:
+  uri_env: "ZILLIZ_URI"
+  token_env: "ZILLIZ_TOKEN"
+  collection_env: "ZILLIZ_COLLECTION"
+  default_collection: "vidre_keyframes"
+  metric_type: "IP"
+  index_type: "AUTOINDEX"
+  beit3_field: "beit3_vector"
+  openclip_field: "openclip_h14_vector"
+
+cockroach:
+  database_url_env: "COCKROACH_DATABASE_URL"
+
+r2:
+  account_id_env: "R2_ACCOUNT_ID"
+  access_key_id_env: "R2_ACCESS_KEY_ID"
+  secret_access_key_env: "R2_SECRET_ACCESS_KEY"
+  bucket_env: "R2_BUCKET"
+  endpoint_url_env: "R2_ENDPOINT_URL"
+  proxy_prefix: "shot-proxies"
+  raw_prefix: "raw-videos"

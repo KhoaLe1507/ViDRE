@@ -1,0 +1,40 @@
+--extra-index-url https://download.pytorch.org/whl/cu117
+
+accelerate==0.30.1
+boto3
+cython
+diffusers==0.27.2
+einops
+fairscale
+ffmpeg-python
+fvcore
+google-generativeai
+huggingface-hub==0.25.2
+matplotlib
+numpy==1.23.5
+opencv-python
+open_clip_torch==2.24.0
+pillow
+psycopg[binary]
+pycocotools
+pymilvus
+pyyaml
+safetensors==0.4.3
+scipy==1.10.1
+sentencepiece
+setuptools==69.5.1
+six
+tensorboard
+tensorflow==2.12.1
+tensorboardX
+terminaltables
+timm==0.6.13
+torch==1.13.1+cu117
+torchmetrics==0.11.4
+torchscale==0.3.0
+torchvision==0.14.1+cu117
+transformers==4.41.2
+yapf==0.40.1
+
+# Co-DETR ships its own mmdet source under external/Co-DETR. Modal installs
+# CUDA-matched mmcv-full in modal_app.py before these requirements.

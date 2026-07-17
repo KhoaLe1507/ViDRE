@@ -1,0 +1,27 @@
+modal_offline:
+  gpu: "L4"
+  vram: "24GB"
+  cpu: 8
+  memory: "64GB"
+  timeout_seconds: 86400
+  container_concurrency: 1
+  video_level_parallelism: "use Modal map/starmap across videos, one GPU container per video job when budget allows"
+  decode_workers_per_container: 4
+  zilliz_insert_batch_size: 256
+  beit3_image_batch_size: 16
+  openclip_image_batch_size: 32
+  codetr_batch_size: 2
+
+modal_online_sd_enabled:
+  gpu: "L4"
+  vram: "24GB"
+  cpu: 8
+  memory: "64GB"
+  timeout_seconds: 21600
+  container_concurrency: 1
+  query_parallelism: "batch queries carefully; avoid multiple SD generations in same GPU container concurrently"
+  sd_micro_batch_size: 1
+  beit3_text_batch_size: 16
+  openclip_text_batch_size: 16
+  generated_image_embedding_batch_size: 5
+  zilliz_search_topk_per_model: 200
