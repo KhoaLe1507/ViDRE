@@ -411,6 +411,19 @@ def _first_rank(candidates: list[Any], predicate) -> int | None:
     return None
 
 
+def _first_unique_video_rank(candidates: list[Any], video_id: str) -> int | None:
+    seen = set()
+    unique_rank = 0
+    for candidate in candidates:
+        if candidate.video_id in seen:
+            continue
+        seen.add(candidate.video_id)
+        unique_rank += 1
+        if candidate.video_id == video_id:
+            return unique_rank
+    return None
+
+
 def _candidate_preview(candidates: list[Any], limit: int = 5) -> list[Dict[str, Any]]:
     return [
         {
@@ -424,6 +437,106 @@ def _candidate_preview(candidates: list[Any], limit: int = 5) -> list[Dict[str, 
     ]
 
 
+def _ranked_videos(video_scores: Dict[str, float]) -> list[Dict[str, Any]]:
+    return [
+        {"video_id": video_id, "score": float(score), "rank": rank}
+        for rank, (video_id, score) in enumerate(
+            sorted(video_scores.items(), key=lambda item: (-float(item[1]), item[0])),
+            start=1,
+        )
+    ]
+
+
+def _rank_of_video(ranked_videos: list[Dict[str, Any]], video_id: str) -> int | None:
+    for item in ranked_videos:
+        if item["video_id"] == video_id:
+            return int(item["rank"])
+    return None
+
+
+def _video_score_strategies(results_by_model: Dict[str, list[Any]], rrf_k: int = 60) -> Dict[str, list[Dict[str, Any]]]:
+    from collections import defaultdict
+
+    single_model_scores: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for model_name, candidates in results_by_model.items():
+        per_video = defaultdict(list)
+        for rank, candidate in enumerate(candidates, start=1):
+            per_video[candidate.video_id].append((rank, float(candidate.score)))
+
+        strategies = {
+            f"{model_name}_first_rrf": {},
+            f"{model_name}_max_score": {},
+            f"{model_name}_mean_top3_score": {},
+            f"{model_name}_sum_top3_score": {},
+            f"{model_name}_rrf_sum_top3_keyframes": {},
+        }
+        for video_id, rank_scores in per_video.items():
+            ranks = sorted(rank for rank, _ in rank_scores)
+            scores = sorted((score for _, score in rank_scores), reverse=True)
+            top3_scores = scores[:3]
+            top3_ranks = ranks[:3]
+            strategies[f"{model_name}_first_rrf"][video_id] = 1.0 / (rrf_k + ranks[0])
+            strategies[f"{model_name}_max_score"][video_id] = top3_scores[0]
+            strategies[f"{model_name}_mean_top3_score"][video_id] = sum(top3_scores) / len(top3_scores)
+            strategies[f"{model_name}_sum_top3_score"][video_id] = sum(top3_scores)
+            strategies[f"{model_name}_rrf_sum_top3_keyframes"][video_id] = sum(1.0 / (rrf_k + rank) for rank in top3_ranks)
+        single_model_scores[model_name] = strategies
+
+    all_scores: Dict[str, Dict[str, float]] = {}
+    for strategies in single_model_scores.values():
+        all_scores.update(strategies)
+
+    combined_names = [
+        "first_rrf",
+        "max_score",
+        "mean_top3_score",
+        "sum_top3_score",
+        "rrf_sum_top3_keyframes",
+    ]
+    for combined_name in combined_names:
+        combined_scores: Dict[str, float] = {}
+        for model_name, strategies in single_model_scores.items():
+            scores = strategies.get(f"{model_name}_{combined_name}", {})
+            for video_id, score in scores.items():
+                combined_scores[video_id] = combined_scores.get(video_id, 0.0) + float(score)
+        all_scores[f"combined_{combined_name}"] = combined_scores
+
+    return {name: _ranked_videos(scores) for name, scores in all_scores.items()}
+
+
+def _resolve_video_path(source_path: str, video_id: str, config: Dict[str, Any]) -> tuple[Any | None, list[Dict[str, Any]]]:
+    from pathlib import Path
+
+    from src.utils.config import get_config_value
+
+    configured_video_dir = Path(get_config_value(config, "paths.video_dir", "/data/TimeLens-Bench/videos/charades"))
+    candidates = [
+        Path(source_path),
+        configured_video_dir / f"{video_id}.mp4",
+        Path("/data/TimeLens-Bench/videos/charades") / f"{video_id}.mp4",
+        Path("/data/data/TimeLens-Bench/videos/charades") / f"{video_id}.mp4",
+    ]
+
+    checked = []
+    seen = set()
+    for path in candidates:
+        path_str = str(path)
+        if path_str in seen:
+            continue
+        seen.add(path_str)
+        exists = path.exists()
+        checked.append(
+            {
+                "path": path_str,
+                "exists": bool(exists),
+                "size_bytes": int(path.stat().st_size) if exists and path.is_file() else None,
+            }
+        )
+        if exists and path.is_file():
+            return path, checked
+    return None, checked
+
+
 @app.function(gpu="L4", cpu=4, memory=32768, timeout=21600, **function_kwargs)
 def diagnose_retrieval_failure_modes(
     config_path: str | None = None,
@@ -435,8 +548,12 @@ def diagnose_retrieval_failure_modes(
     require_gt_span_keyframe: bool = True,
     global_depth: int = 500,
     in_video_depth: int = 500,
+    output_path: str | None = None,
 ) -> str:
     _prepare_runtime()
+    from datetime import datetime, timezone
+    from pathlib import Path
+
     from src.eval.metrics import compute_hits, is_correct_keyframe
     from src.eval.run_evaluation import (
         filter_samples_with_gt_span_keyframes,
@@ -480,6 +597,7 @@ def diagnose_retrieval_failure_modes(
     config_version = config["project"]["config_version"]
     rows = []
     global_first_gt_video_ranks = []
+    global_first_gt_video_unique_ranks = []
     global_first_correct_ranks = []
     in_video_first_correct_ranks = []
     sample_failures = []
@@ -509,6 +627,9 @@ def diagnose_retrieval_failure_modes(
 
         if first_gt_video_rank is not None:
             global_first_gt_video_ranks.append(first_gt_video_rank)
+        first_gt_video_unique_rank = _first_unique_video_rank(global_results, sample.video_id)
+        if first_gt_video_unique_rank is not None:
+            global_first_gt_video_unique_ranks.append(first_gt_video_unique_rank)
         if first_correct_global_rank is not None:
             global_first_correct_ranks.append(first_correct_global_rank)
         if first_correct_in_video_rank is not None:
@@ -526,6 +647,7 @@ def diagnose_retrieval_failure_modes(
                 "hit_at_10": in_video_hits["hit_at_10"],
             },
             "first_gt_video_rank_global": first_gt_video_rank,
+            "first_gt_video_unique_rank_global": first_gt_video_unique_rank,
             "first_correct_rank_global": first_correct_global_rank,
             "first_correct_rank_in_video": first_correct_in_video_rank,
         }
@@ -550,7 +672,41 @@ def diagnose_retrieval_failure_modes(
     def avg(values: list[int]) -> float | None:
         return (sum(values) / len(values)) if values else None
 
-    payload = {
+    def unique_video_recall_at(k: int) -> float:
+        if not n:
+            return 0.0
+        return sum(
+            1
+            for row in rows
+            if row["first_gt_video_unique_rank_global"] is not None
+            and int(row["first_gt_video_unique_rank_global"]) <= k
+        ) / n
+
+    def estimated_block_recall_at(k: int, block_size: int) -> float:
+        if not n:
+            return 0.0
+        hits = 0
+        for row in rows:
+            unique_rank = row["first_gt_video_unique_rank_global"]
+            in_video_rank = row["first_correct_rank_in_video"]
+            if unique_rank is None or in_video_rank is None:
+                continue
+            if int(in_video_rank) > block_size:
+                continue
+            estimated_position = (int(unique_rank) - 1) * block_size + int(in_video_rank)
+            if estimated_position <= k:
+                hits += 1
+        return hits / n
+
+    two_stage_estimates = {}
+    for block_size in [1, 2, 3, 5]:
+        two_stage_estimates[f"block_{block_size}_per_video"] = {
+            "estimated_recall_at_1": estimated_block_recall_at(1, block_size),
+            "estimated_recall_at_5": estimated_block_recall_at(5, block_size),
+            "estimated_recall_at_10": estimated_block_recall_at(10, block_size),
+        }
+
+    summary = {
         "num_queries": n,
         "offset": int(offset),
         "limit": limit,
@@ -566,6 +722,9 @@ def diagnose_retrieval_failure_modes(
         "global_video_recall_at_1": ratio("video_hit_at_1"),
         "global_video_recall_at_5": ratio("video_hit_at_5"),
         "global_video_recall_at_10": ratio("video_hit_at_10"),
+        "global_unique_video_recall_at_1": unique_video_recall_at(1),
+        "global_unique_video_recall_at_5": unique_video_recall_at(5),
+        "global_unique_video_recall_at_10": unique_video_recall_at(10),
         "in_video_temporal_recall_at_1": ratio("hit_at_1", scope="in_video"),
         "in_video_temporal_recall_at_5": ratio("hit_at_5", scope="in_video"),
         "in_video_temporal_recall_at_10": ratio("hit_at_10", scope="in_video"),
@@ -573,11 +732,32 @@ def diagnose_retrieval_failure_modes(
         "found_correct_keyframe_within_global_depth": (len(global_first_correct_ranks) / n) if n else 0.0,
         "found_correct_keyframe_within_in_video_depth": (len(in_video_first_correct_ranks) / n) if n else 0.0,
         "avg_first_gt_video_rank_global": avg(global_first_gt_video_ranks),
+        "avg_first_gt_video_unique_rank_global": avg(global_first_gt_video_unique_ranks),
         "avg_first_correct_rank_global": avg(global_first_correct_ranks),
         "avg_first_correct_rank_in_video": avg(in_video_first_correct_ranks),
-        "sample_failures": sample_failures,
+        "estimated_two_stage_block_rerank": two_stage_estimates,
     }
-    return json.dumps(payload, indent=2, ensure_ascii=False, default=_json_default)
+    payload = {
+        **summary,
+        "sample_failures": sample_failures,
+        "per_query": rows,
+    }
+
+    if output_path is None:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        output_root = Path("/data/outputs/diagnostics" if modal is not None else "outputs/diagnostics")
+        output_path_obj = output_root / f"retrieval_failure_modes_{model_space}_{timestamp}.json"
+    else:
+        output_path_obj = Path(output_path)
+    output_path_obj.parent.mkdir(parents=True, exist_ok=True)
+    output_path_obj.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
+    if modal is not None:
+        volume.commit()
+
+    summary["output_path"] = str(output_path_obj)
+    summary["sample_failures_count"] = len(sample_failures)
+    summary["per_query_count"] = len(rows)
+    return json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default)
 
 
 @app.local_entrypoint(name="diagnose_retrieval_failure_modes_cli")
@@ -591,6 +771,7 @@ def diagnose_retrieval_failure_modes_cli(
     require_gt_span_keyframe: bool = True,
     global_depth: int = 500,
     in_video_depth: int = 500,
+    output_path: str | None = None,
 ):
     print(
         diagnose_retrieval_failure_modes.remote(
@@ -603,6 +784,196 @@ def diagnose_retrieval_failure_modes_cli(
             require_gt_span_keyframe=require_gt_span_keyframe,
             global_depth=global_depth,
             in_video_depth=in_video_depth,
+            output_path=output_path,
+        )
+    )
+
+
+@app.function(gpu="L4", cpu=4, memory=32768, timeout=21600, **function_kwargs)
+def diagnose_video_aggregation_strategies(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    limit: int | None = 100,
+    offset: int = 0,
+    model_spaces: str = "openclip,beit3",
+    require_verified_gt_video: bool = True,
+    require_gt_span_keyframe: bool = True,
+    global_depth: int = 1000,
+    output_path: str | None = None,
+) -> str:
+    _prepare_runtime()
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from src.eval.run_evaluation import (
+        filter_samples_with_gt_span_keyframes,
+        load_query_samples,
+        load_verified_video_ids,
+    )
+    from src.models.load_beit3 import BEiT3Encoder
+    from src.models.load_openclip import OpenCLIPH14Encoder
+    from src.storage.zilliz_client import ZillizClient
+    from src.utils.config import get_config_value, load_config
+
+    selected_models = [item.strip() for item in str(model_spaces).split(",") if item.strip()]
+    if not selected_models:
+        raise ValueError("model_spaces must contain at least one model name.")
+
+    config_path = _default_config_path(config_path)
+    config = load_config(config_path)
+    dataset_path = dataset_path or (
+        "/data/TimeLens-Bench/charades-timelens-query-samples.json"
+        if modal is not None
+        else get_config_value(config, "paths.dataset_query_samples")
+    )
+    samples = load_query_samples(dataset_path)
+    if require_verified_gt_video:
+        verified_video_ids = load_verified_video_ids(config)
+        samples = [sample for sample in samples if sample.video_id in verified_video_ids]
+    if require_gt_span_keyframe:
+        samples = filter_samples_with_gt_span_keyframes(config, samples)
+    if offset:
+        samples = samples[int(offset) :]
+    if limit is not None:
+        samples = samples[:limit]
+
+    zilliz = ZillizClient(config)
+    encoders: Dict[str, Any] = {}
+    vector_fields: Dict[str, str] = {}
+    for model_name in selected_models:
+        if model_name == "openclip":
+            encoders[model_name] = OpenCLIPH14Encoder(config).load()
+            vector_fields[model_name] = zilliz.openclip_field
+        elif model_name == "beit3":
+            encoders[model_name] = BEiT3Encoder(config).load()
+            vector_fields[model_name] = zilliz.beit3_field
+        else:
+            raise ValueError(f"Unsupported model_space={model_name!r}. Expected openclip or beit3.")
+
+    per_query = []
+    strategy_ranks: Dict[str, list[int]] = {}
+    strategy_missing: Dict[str, int] = {}
+
+    for sample in samples:
+        results_by_model: Dict[str, list[Any]] = {}
+        for model_name in selected_models:
+            vector = encoders[model_name].encode_texts([sample.query_text])[0]
+            results_by_model[model_name] = zilliz.search(vector_fields[model_name], vector, int(global_depth))
+
+        ranked_by_strategy = _video_score_strategies(results_by_model)
+        query_ranks: Dict[str, int | None] = {}
+        query_top_videos: Dict[str, list[Dict[str, Any]]] = {}
+        for strategy_name, ranked_videos in ranked_by_strategy.items():
+            rank = _rank_of_video(ranked_videos, sample.video_id)
+            query_ranks[strategy_name] = rank
+            if rank is None:
+                strategy_missing[strategy_name] = strategy_missing.get(strategy_name, 0) + 1
+            else:
+                strategy_ranks.setdefault(strategy_name, []).append(rank)
+            query_top_videos[strategy_name] = ranked_videos[:10]
+
+        per_query.append(
+            {
+                "query_id": sample.query_id,
+                "query_text": sample.query_text,
+                "video_id": sample.video_id,
+                "gt_span": sample.gt_span,
+                "strategy_video_ranks": query_ranks,
+                "top_videos": query_top_videos,
+            }
+        )
+
+    n = len(per_query)
+    strategy_summary = []
+    strategy_names = sorted(set(strategy_ranks) | set(strategy_missing))
+    for strategy_name in strategy_names:
+        ranks = strategy_ranks.get(strategy_name, [])
+
+        def recall_at(k: int) -> float:
+            return (sum(1 for rank in ranks if rank <= k) / n) if n else 0.0
+
+        strategy_summary.append(
+            {
+                "strategy": strategy_name,
+                "video_recall_at_1": recall_at(1),
+                "video_recall_at_5": recall_at(5),
+                "video_recall_at_10": recall_at(10),
+                "video_recall_at_20": recall_at(20),
+                "video_recall_at_50": recall_at(50),
+                "video_recall_at_100": recall_at(100),
+                "found_within_depth": (len(ranks) / n) if n else 0.0,
+                "avg_video_rank": (sum(ranks) / len(ranks)) if ranks else None,
+                "missing": strategy_missing.get(strategy_name, 0),
+            }
+        )
+    strategy_summary = sorted(
+        strategy_summary,
+        key=lambda item: (
+            -float(item["video_recall_at_10"]),
+            -float(item["video_recall_at_20"]),
+            float(item["avg_video_rank"]) if item["avg_video_rank"] is not None else 10**9,
+            str(item["strategy"]),
+        ),
+    )
+
+    payload = {
+        "num_queries": n,
+        "offset": int(offset),
+        "limit": limit,
+        "model_spaces": selected_models,
+        "vector_fields": vector_fields,
+        "require_verified_gt_video": bool(require_verified_gt_video),
+        "require_gt_span_keyframe": bool(require_gt_span_keyframe),
+        "global_depth": int(global_depth),
+        "strategy_summary": strategy_summary,
+        "per_query": per_query,
+    }
+
+    if output_path is None:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        output_root = Path("/data/outputs/diagnostics" if modal is not None else "outputs/diagnostics")
+        safe_models = "_".join(selected_models)
+        output_path_obj = output_root / f"video_aggregation_{safe_models}_{timestamp}.json"
+    else:
+        output_path_obj = Path(output_path)
+    output_path_obj.parent.mkdir(parents=True, exist_ok=True)
+    output_path_obj.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
+    if modal is not None:
+        volume.commit()
+
+    summary = {
+        "num_queries": n,
+        "model_spaces": selected_models,
+        "global_depth": int(global_depth),
+        "top_strategies": strategy_summary[:10],
+        "output_path": str(output_path_obj),
+    }
+    return json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default)
+
+
+@app.local_entrypoint(name="diagnose_video_aggregation_strategies_cli")
+def diagnose_video_aggregation_strategies_cli(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    limit: int | None = 100,
+    offset: int = 0,
+    model_spaces: str = "openclip,beit3",
+    require_verified_gt_video: bool = True,
+    require_gt_span_keyframe: bool = True,
+    global_depth: int = 1000,
+    output_path: str | None = None,
+):
+    print(
+        diagnose_video_aggregation_strategies.remote(
+            config_path=config_path,
+            dataset_path=dataset_path,
+            limit=limit,
+            offset=offset,
+            model_spaces=model_spaces,
+            require_verified_gt_video=require_verified_gt_video,
+            require_gt_span_keyframe=require_gt_span_keyframe,
+            global_depth=global_depth,
+            output_path=output_path,
         )
     )
 
@@ -654,10 +1025,6 @@ def diagnose_embedding_self_retrieval(
             )
             rows = list(cur.fetchall())
 
-        video_dir = Path(get_config_value(config, "paths.video_dir", "/data/TimeLens-Bench/videos/charades"))
-        if modal is not None and not str(video_dir).startswith("/data/"):
-            video_dir = Path("/data/TimeLens-Bench/videos/charades")
-
         checked = 0
         top1_hits = 0
         topk_hits = 0
@@ -666,10 +1033,8 @@ def diagnose_embedding_self_retrieval(
             video_id = str(row["video_id"])
             keyframe_id = str(row["keyframe_id"])
             frame_index = int(row["frame_index_raw"])
-            source_path = Path(str(row["source_path"]))
-            if not source_path.exists():
-                source_path = video_dir / f"{video_id}.mp4"
-            frames = read_frames_by_index(source_path, [frame_index]) if source_path.exists() else []
+            source_path, checked_paths = _resolve_video_path(str(row["source_path"]), video_id, config)
+            frames = read_frames_by_index(source_path, [frame_index]) if source_path is not None else []
             if not frames:
                 if len(failures) < 20:
                     failures.append(
@@ -677,7 +1042,8 @@ def diagnose_embedding_self_retrieval(
                             "keyframe_id": keyframe_id,
                             "video_id": video_id,
                             "frame_index_raw": frame_index,
-                            "error": f"cannot_read_frame path={source_path}",
+                            "error": "cannot_read_frame",
+                            "checked_paths": checked_paths,
                         }
                     )
                 continue
@@ -730,6 +1096,63 @@ def diagnose_embedding_self_retrieval_cli(
             top_k=top_k,
         )
     )
+
+
+@app.function(cpu=1, memory=1024, timeout=300, **function_kwargs)
+def inspect_modal_volume_video_paths(video_ids: str = "00607,00T1E,02DPI") -> str:
+    _prepare_runtime()
+    from pathlib import Path
+
+    ids = [item.strip() for item in str(video_ids).split(",") if item.strip()]
+    roots = [
+        Path("/data/TimeLens-Bench/videos/charades"),
+        Path("/data/data/TimeLens-Bench/videos/charades"),
+        Path("/data/TimeLens-Bench"),
+        Path("/data/data/TimeLens-Bench"),
+        Path("/data"),
+    ]
+    root_payload = []
+    for root in roots:
+        item: Dict[str, Any] = {
+            "path": str(root),
+            "exists": root.exists(),
+            "is_dir": root.is_dir(),
+        }
+        if root.exists() and root.is_dir():
+            mp4s = list(root.glob("*.mp4"))
+            item["mp4_count_direct"] = len(mp4s)
+            item["sample_mp4s_direct"] = [path.name for path in mp4s[:10]]
+            item["sample_children"] = [path.name for path in list(root.iterdir())[:20]]
+        root_payload.append(item)
+
+    video_payload = []
+    for video_id in ids:
+        candidates = []
+        for root in roots[:2]:
+            path = root / f"{video_id}.mp4"
+            candidates.append(
+                {
+                    "path": str(path),
+                    "exists": path.exists(),
+                    "size_bytes": int(path.stat().st_size) if path.exists() and path.is_file() else None,
+                }
+            )
+        video_payload.append({"video_id": video_id, "candidates": candidates})
+
+    return json.dumps(
+        {
+            "roots": root_payload,
+            "videos": video_payload,
+        },
+        indent=2,
+        ensure_ascii=False,
+        default=_json_default,
+    )
+
+
+@app.local_entrypoint(name="inspect_modal_volume_video_paths_cli")
+def inspect_modal_volume_video_paths_cli(video_ids: str = "00607,00T1E,02DPI"):
+    print(inspect_modal_volume_video_paths.remote(video_ids=video_ids))
 
 
 @app.function(cpu=1, memory=1024, timeout=900, **function_kwargs)
