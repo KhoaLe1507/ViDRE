@@ -64,6 +64,28 @@ Query:
 """
 
 
+SCENE_REWRITE_PROMPT = """You rewrite short action queries for a text-to-keyframe retrieval system.
+
+The retrieval system searches static video keyframes, so rewrite the query into one concise English sentence that is more visually searchable as a scene/object/event description.
+
+Important constraints:
+- You can only use the original query below. You cannot see the video.
+- Preserve the original meaning exactly.
+- Do not invent specific objects, locations, clothing, colors, counts, camera views, or background details that are not explicitly stated or strongly implied.
+- Prefer concrete visual wording when the original query provides it.
+- If the original query is generic, keep the rewrite generic instead of hallucinating details.
+- Return valid JSON only.
+
+JSON format:
+{
+  "rewritten_query": "..."
+}
+
+Original query:
+{{query}}
+"""
+
+
 class GeminiClient:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
@@ -95,6 +117,19 @@ class GeminiClient:
             except Exception:
                 continue
         return []
+
+    def rewrite_for_keyframe_search(self, query: str) -> str:
+        prompt = SCENE_REWRITE_PROMPT.replace("{{query}}", query)
+        max_retries = int(get_config_value(self.config, "models.gemini.max_retries", 2))
+        for _ in range(max_retries + 1):
+            try:
+                payload = _parse_json_object(self._generate_text(prompt))
+                rewritten = _validate_scene_rewrite(query, payload.get("rewritten_query"))
+                if rewritten:
+                    return rewritten
+            except Exception:
+                continue
+        return _fallback_scene_rewrite(query)
 
     def _generate_text(self, prompt: str) -> str:
         try:
@@ -159,6 +194,26 @@ def _fallback_paraphrases(query: str) -> List[str]:
     return results[:5]
 
 
+def _validate_scene_rewrite(original: str, rewritten: Any) -> str:
+    if not isinstance(rewritten, str):
+        return ""
+    text = " ".join(rewritten.split())
+    if not text:
+        return ""
+    if len(text) > 240:
+        text = text[:240].rsplit(" ", 1)[0].strip()
+    return text
+
+
+def _fallback_scene_rewrite(query: str) -> str:
+    clean = " ".join(query.split()).strip()
+    if not clean:
+        return clean
+    clean = clean.rstrip(".")
+    lowered = clean[0].lower() + clean[1:] if clean else clean
+    return f"A video keyframe showing {lowered}."
+
+
 _COCO_SET = set(COCO_CLASSES)
 _COCO_ALIASES = {
     "people": "person",
@@ -202,4 +257,3 @@ def _normalize_coco_name(name: str) -> str:
     if name.endswith("s") and name[:-1] in _COCO_SET:
         return name[:-1]
     return name
-

@@ -121,6 +121,36 @@ evaluation:
 online:
   mode: "full"
 
+video_aggregation:
+  global_depth: 1000
+  keyframes_per_video: 1
+  score_strategy: "mean_topk"
+  score_top_k: 3
+
+window_aggregation:
+  window_size_seconds: 8.0
+  window_stride_seconds: 4.0
+  score_strategy: "mean_topk"
+  window_score_top_k: 3
+  keyframes_per_window: 1
+  max_windows_per_video: 1
+
+xpool_heuristic:
+  candidate_videos: 100
+  keyframes_per_video: 1
+  temperature: 0.07
+  num_heads: 1
+  dropout: 0.3
+  checkpoint:
+
+xpool_paperlike:
+  num_frames: 12
+  keyframes_per_video: 1
+  batch_size: 128
+  num_heads: 1
+  dropout: 0.3
+  checkpoint:
+
 zilliz:
   uri_env: "ZILLIZ_URI"
   token_env: "ZILLIZ_TOKEN"
@@ -128,6 +158,7 @@ zilliz:
   default_collection: "vidre_keyframes"
   metric_type: "IP"
   index_type: "AUTOINDEX"
+  query_batch_size: 256
   beit3_field: "beit3_vector"
   openclip_field: "openclip_h14_vector"
 

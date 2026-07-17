@@ -266,6 +266,176 @@ def inspect_storage_state_cli(config_path: str | None = None):
 
 
 @app.function(cpu=1, memory=1024, timeout=900, **function_kwargs)
+def list_processed_videos(
+    config_path: str | None = None,
+    status: str = "VERIFIED",
+    limit: int | None = None,
+    offset: int = 0,
+    preview_limit: int = 50,
+    output_path: str | None = None,
+) -> str:
+    _prepare_runtime()
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from src.storage.cockroach_client import CockroachClient
+    from src.utils.config import load_config
+
+    config_path = _default_config_path(config_path)
+    config = load_config(config_path)
+    model_version = str(config["project"]["model_version"])
+    config_version = str(config["project"]["config_version"])
+    requested_status = str(status or "VERIFIED")
+    statuses = [item.strip().upper() for item in requested_status.split(",") if item.strip()]
+    include_all_statuses = not statuses or "ALL" in statuses
+
+    where_clauses = ["v.model_version = %s", "v.config_version = %s"]
+    where_params: list[Any] = [model_version, config_version]
+    if not include_all_statuses:
+        placeholders = ", ".join(["%s"] * len(statuses))
+        where_clauses.append(f"v.processing_status IN ({placeholders})")
+        where_params.extend(statuses)
+    where_sql = " AND ".join(where_clauses)
+
+    limit_sql = ""
+    query_params: list[Any] = [
+        model_version,
+        config_version,
+        model_version,
+        config_version,
+        *where_params,
+    ]
+    if limit is not None:
+        limit_sql += " LIMIT %s"
+        query_params.append(int(limit))
+    if offset:
+        limit_sql += " OFFSET %s"
+        query_params.append(int(offset))
+
+    cockroach = CockroachClient(config)
+    try:
+        with cockroach.conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT count(*) AS n
+                FROM videos v
+                WHERE {where_sql}
+                """,
+                tuple(where_params),
+            )
+            selected_count = int(cur.fetchone()["n"])
+            cur.execute(
+                """
+                SELECT processing_status, count(*) AS n
+                FROM videos
+                WHERE model_version = %s AND config_version = %s
+                GROUP BY processing_status
+                ORDER BY processing_status
+                """,
+                (model_version, config_version),
+            )
+            status_counts = {str(row["processing_status"]): int(row["n"]) for row in cur.fetchall()}
+            cur.execute(
+                f"""
+                SELECT
+                    v.video_id,
+                    v.processing_status,
+                    v.source_path,
+                    v.duration_raw,
+                    v.fps_raw,
+                    v.updated_at,
+                    COALESCE(s.shot_count, 0) AS shot_count,
+                    COALESCE(k.keyframe_count, 0) AS keyframe_count
+                FROM videos v
+                LEFT JOIN (
+                    SELECT video_id, count(*) AS shot_count
+                    FROM shots
+                    WHERE model_version = %s AND config_version = %s
+                    GROUP BY video_id
+                ) s ON s.video_id = v.video_id
+                LEFT JOIN (
+                    SELECT video_id, count(*) AS keyframe_count
+                    FROM keyframes
+                    WHERE model_version = %s AND config_version = %s
+                    GROUP BY video_id
+                ) k ON k.video_id = v.video_id
+                WHERE {where_sql}
+                ORDER BY v.video_id
+                {limit_sql}
+                """,
+                tuple(query_params),
+            )
+            rows = [
+                {
+                    "video_id": str(row["video_id"]),
+                    "processing_status": str(row["processing_status"]),
+                    "source_path": str(row["source_path"]),
+                    "duration_raw": float(row["duration_raw"]),
+                    "fps_raw": float(row["fps_raw"]),
+                    "shot_count": int(row["shot_count"]),
+                    "keyframe_count": int(row["keyframe_count"]),
+                    "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+                }
+                for row in cur.fetchall()
+            ]
+
+        payload = {
+            "status_filter": "ALL" if include_all_statuses else statuses,
+            "model_version": model_version,
+            "config_version": config_version,
+            "selected_count": selected_count,
+            "returned_count": len(rows),
+            "offset": int(offset),
+            "limit": int(limit) if limit is not None else None,
+            "status_counts": status_counts,
+            "videos": rows,
+        }
+        if output_path is None:
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            output_root = Path("/data/outputs/diagnostics" if modal is not None else "outputs/diagnostics")
+            output_path_obj = output_root / f"processed_videos_{timestamp}.json"
+        else:
+            output_path_obj = Path(output_path)
+        output_path_obj.parent.mkdir(parents=True, exist_ok=True)
+        output_path_obj.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
+        if modal is not None:
+            volume.commit()
+
+        summary = {
+            "status_filter": payload["status_filter"],
+            "selected_count": selected_count,
+            "returned_count": len(rows),
+            "status_counts": status_counts,
+            "output_path": str(output_path_obj),
+            "preview": rows[: max(0, int(preview_limit))],
+        }
+        return json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default)
+    finally:
+        cockroach.close()
+
+
+@app.local_entrypoint(name="list_processed_videos_cli")
+def list_processed_videos_cli(
+    config_path: str | None = None,
+    status: str = "VERIFIED",
+    limit: int | None = None,
+    offset: int = 0,
+    preview_limit: int = 50,
+    output_path: str | None = None,
+):
+    print(
+        list_processed_videos.remote(
+            config_path=config_path,
+            status=status,
+            limit=limit,
+            offset=offset,
+            preview_limit=preview_limit,
+            output_path=output_path,
+        )
+    )
+
+
+@app.function(cpu=1, memory=1024, timeout=900, **function_kwargs)
 def inspect_eval_oracle_coverage(
     config_path: str | None = None,
     dataset_path: str | None = None,
@@ -400,6 +570,414 @@ def inspect_eval_oracle_coverage_cli(
     )
 
 
+@app.function(cpu=2, memory=8192, timeout=21600, **function_kwargs)
+def generate_scene_moment_queries(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    output_path: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    frames_per_query: int = 4,
+    require_verified_gt_video: bool = True,
+    require_gt_span_keyframe: bool = True,
+) -> str:
+    _prepare_runtime()
+    from pathlib import Path
+
+    from src.eval.run_evaluation import (
+        filter_samples_with_gt_span_keyframes,
+        load_query_samples,
+        load_verified_video_ids,
+    )
+    from src.utils.config import get_config_value, load_config
+    from src.utils.video_io import get_video_metadata, read_frames_by_index
+
+    config_path = _default_config_path(config_path)
+    config = load_config(config_path)
+    dataset_path = dataset_path or (
+        "/data/TimeLens-Bench/charades-timelens-query-samples.json"
+        if modal is not None
+        else get_config_value(config, "paths.dataset_query_samples")
+    )
+    output_path = output_path or (
+        "/data/TimeLens-Bench/charades-timelens-query-samples-scene-moment-first100.json"
+        if modal is not None
+        else "outputs/query_sets/charades-timelens-query-samples-scene-moment-first100.json"
+    )
+
+    samples = load_query_samples(dataset_path)
+    if require_verified_gt_video:
+        verified_video_ids = load_verified_video_ids(config)
+        samples = [sample for sample in samples if sample.video_id in verified_video_ids]
+    if require_gt_span_keyframe:
+        samples = filter_samples_with_gt_span_keyframes(config, samples)
+    if offset:
+        samples = samples[int(offset) :]
+    samples = samples[: int(limit)]
+
+    api_key_env = get_config_value(config, "models.gemini.api_key_env", "GEMINI_API_KEY")
+    model_env = get_config_value(config, "models.gemini.model_env", "GEMINI_MODEL")
+    api_key = os.environ.get(api_key_env, "")
+    model_name = os.environ.get(model_env, "")
+    if not api_key or not model_name:
+        raise RuntimeError(f"{api_key_env} and {model_env} must be set.")
+
+    import google.generativeai as genai
+
+    genai.configure(api_key=api_key)
+    gemini_model = genai.GenerativeModel(model_name)
+
+    rows = []
+    failures = []
+    for index, sample in enumerate(samples, start=1):
+        try:
+            source_path, checked_paths = _resolve_video_path("", sample.video_id, config)
+            if source_path is None:
+                raise RuntimeError(f"Cannot resolve video path for {sample.video_id}: {checked_paths}")
+            metadata = get_video_metadata(source_path)
+            fps = float(metadata["fps_raw"] or 0.0)
+            duration = float(metadata["duration_raw"] or sample.duration or 0.0)
+            frame_indices = _sample_frame_indices_for_span(
+                sample.gt_span,
+                fps=fps,
+                duration=duration,
+                frames_per_query=frames_per_query,
+            )
+            frames = read_frames_by_index(source_path, frame_indices)
+            if not frames:
+                raise RuntimeError(f"Cannot read sampled frames for {sample.query_id}: {frame_indices}")
+            contact_sheet = _make_candidate_contact_sheet(frames, thumb_size=(256, 192), columns=len(frames))
+            prompt = (
+                "You are rewriting an action-centric video retrieval query into a scene/moment/event query.\n"
+                "Use the provided frames from the ground-truth video moment as visual evidence.\n"
+                "Write one natural English query that describes the visible scene, setting, people, clothing, objects, "
+                "spatial relations, and the broader moment. It should be useful for text-to-video/keyframe retrieval.\n"
+                "Do not mention frame numbers, timestamps, dataset names, or that you are looking at images.\n"
+                "Keep it one sentence, specific but not overly long, about 20-35 words.\n"
+                "Return valid JSON only in this format: "
+                "{\"scene_moment_query\": \"...\", \"visible_cues\": [\"...\", \"...\"]}.\n\n"
+                f"Original action query: {sample.query_text}\n"
+                f"Video id: {sample.video_id}\n"
+                f"Ground-truth span: {sample.gt_span[0]} to {sample.gt_span[1]} seconds\n"
+            )
+            response = gemini_model.generate_content([prompt, contact_sheet])
+            payload = _parse_json_from_text(response.text or "{}")
+            scene_query = str(payload.get("scene_moment_query") or "").strip()
+            if not scene_query:
+                raise RuntimeError(f"Gemini returned empty scene_moment_query for {sample.query_id}")
+            rows.append(
+                {
+                    "query_id": sample.query_id,
+                    "video_id": sample.video_id,
+                    "query_index": index - 1 + int(offset),
+                    "duration": sample.duration,
+                    "query": scene_query,
+                    "query_text": scene_query,
+                    "span": sample.gt_span,
+                    "gt_span": sample.gt_span,
+                    "original_query": sample.query_text,
+                    "query_style": "scene_moment_event",
+                    "generation_model": model_name,
+                    "sampled_frame_indices": frame_indices,
+                    "visible_cues": payload.get("visible_cues") or [],
+                }
+            )
+        except Exception as exc:
+            failures.append(
+                {
+                    "query_id": sample.query_id,
+                    "video_id": sample.video_id,
+                    "original_query": sample.query_text,
+                    "error": repr(exc),
+                }
+            )
+
+    output_path_obj = Path(output_path)
+    output_path_obj.parent.mkdir(parents=True, exist_ok=True)
+    output_path_obj.write_text(json.dumps(rows, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
+    diagnostics_path = output_path_obj.with_suffix(".diagnostics.json")
+    diagnostics_path.write_text(
+        json.dumps(
+            {
+                "source_dataset_path": str(dataset_path),
+                "output_path": str(output_path_obj),
+                "requested_limit": int(limit),
+                "offset": int(offset),
+                "generated_count": len(rows),
+                "failure_count": len(failures),
+                "failures": failures[:50],
+                "require_verified_gt_video": bool(require_verified_gt_video),
+                "require_gt_span_keyframe": bool(require_gt_span_keyframe),
+            },
+            indent=2,
+            ensure_ascii=False,
+            default=_json_default,
+        ),
+        encoding="utf-8",
+    )
+    if modal is not None:
+        volume.commit()
+
+    summary = {
+        "output_path": str(output_path_obj),
+        "diagnostics_path": str(diagnostics_path),
+        "generated_count": len(rows),
+        "failure_count": len(failures),
+        "preview": rows[:5],
+    }
+    return json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default)
+
+
+def _sample_frame_indices_for_span(
+    gt_span: list[float],
+    fps: float,
+    duration: float,
+    frames_per_query: int,
+) -> list[int]:
+    if fps <= 0.0:
+        return []
+    frames_per_query = max(1, int(frames_per_query))
+    start = max(0.0, float(gt_span[0]))
+    end = min(float(duration), max(start, float(gt_span[1])))
+    if end <= start:
+        end = min(float(duration), start + 1.0)
+    if end <= start:
+        end = max(start, float(duration))
+    if frames_per_query == 1:
+        times = [(start + end) / 2.0]
+    else:
+        times = [
+            start + ((end - start) * position / float(frames_per_query - 1))
+            for position in range(frames_per_query)
+        ]
+    max_frame_index = max(0, int(round(float(duration) * fps)) - 1)
+    indices = sorted({max(0, min(max_frame_index, int(round(time_sec * fps)))) for time_sec in times})
+    return indices
+
+
+@app.local_entrypoint(name="generate_scene_moment_queries_cli")
+def generate_scene_moment_queries_cli(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    output_path: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    frames_per_query: int = 4,
+    require_verified_gt_video: bool = True,
+    require_gt_span_keyframe: bool = True,
+):
+    print(
+        generate_scene_moment_queries.remote(
+            config_path=config_path,
+            dataset_path=dataset_path,
+            output_path=output_path,
+            limit=limit,
+            offset=offset,
+            frames_per_query=frames_per_query,
+            require_verified_gt_video=require_verified_gt_video,
+            require_gt_span_keyframe=require_gt_span_keyframe,
+        )
+    )
+
+
+def _manual_scene_moment_query_rows() -> list[Dict[str, Any]]:
+    return [
+        {
+            "query_id": "N0NLE_001",
+            "video_id": "N0NLE",
+            "query_index": 1,
+            "duration": 29.529500000000002,
+            "query": (
+                "In a carpeted hallway outside a bedroom, a blonde girl in a black-and-white striped shirt "
+                "and pink shorts looks down at a phone near an open doorway and a crutch."
+            ),
+            "query_text": (
+                "In a carpeted hallway outside a bedroom, a blonde girl in a black-and-white striped shirt "
+                "and pink shorts looks down at a phone near an open doorway and a crutch."
+            ),
+            "span": [0.0, 24.0],
+            "gt_span": [0.0, 24.0],
+            "original_query": "A person is playing with a mobile phone.",
+            "query_style": "scene_moment_event",
+            "generation_model": "manual_video_inspection",
+            "sampled_frame_indices": [0, 240, 480, 719],
+            "visible_cues": [
+                "Blonde girl holding a mobile phone",
+                "Black-and-white striped shirt with a pink heart",
+                "Pink shorts",
+                "Carpeted hallway and open bedroom doorway",
+                "Crutch leaning near the wall",
+            ],
+        },
+        {
+            "query_id": "FRSBQ_000",
+            "video_id": "FRSBQ",
+            "query_index": 0,
+            "duration": 32.0,
+            "query": (
+                "In a purple-walled bedroom with red curtains and a patterned bed, a young person in red pants "
+                "stands beside the bed while holding a striped shirt."
+            ),
+            "query_text": (
+                "In a purple-walled bedroom with red curtains and a patterned bed, a young person in red pants "
+                "stands beside the bed while holding a striped shirt."
+            ),
+            "span": [21.0, 32.0],
+            "gt_span": [21.0, 32.0],
+            "original_query": "A person is taking off clothes.",
+            "query_style": "scene_moment_event",
+            "generation_model": "manual_video_inspection",
+            "sampled_frame_indices": [630, 740, 850, 960],
+            "visible_cues": [
+                "Purple bedroom wall",
+                "Red curtains with a window behind them",
+                "Patterned bed with blankets",
+                "Young person wearing red pants",
+                "Striped shirt being held near the bed",
+            ],
+        },
+        {
+            "query_id": "PCNUP_005",
+            "video_id": "PCNUP",
+            "query_index": 5,
+            "duration": 23.6,
+            "query": (
+                "Inside a small closet filled with hanging clothes and items on the floor, a girl in a bright pink "
+                "shirt stands near the doorway while handling clothing."
+            ),
+            "query_text": (
+                "Inside a small closet filled with hanging clothes and items on the floor, a girl in a bright pink "
+                "shirt stands near the doorway while handling clothing."
+            ),
+            "span": [10.0, 12.0],
+            "gt_span": [10.0, 12.0],
+            "original_query": "A person takes clothes off the hanger.",
+            "query_style": "scene_moment_event",
+            "generation_model": "manual_video_inspection",
+            "sampled_frame_indices": [300, 320, 340, 360],
+            "visible_cues": [
+                "Small closet space",
+                "Many hanging clothes on the left",
+                "Girl wearing a bright pink shirt and jeans",
+                "Cluttered closet floor",
+                "Doorway and pink wall nearby",
+            ],
+        },
+    ]
+
+
+@app.function(cpu=1, memory=2048, timeout=900, **function_kwargs)
+def patch_scene_moment_first1000_manual_queries(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    scene_query_path: str = "/data/TimeLens-Bench/charades-timelens-query-samples-scene-moment-first1000.json",
+    diagnostics_path: str = "/data/TimeLens-Bench/charades-timelens-query-samples-scene-moment-first1000.diagnostics.json",
+) -> str:
+    _prepare_runtime()
+    from pathlib import Path
+
+    from src.eval.run_evaluation import (
+        filter_samples_with_gt_span_keyframes,
+        load_query_samples,
+        load_verified_video_ids,
+    )
+    from src.utils.config import get_config_value, load_config
+
+    config_path = _default_config_path(config_path)
+    config = load_config(config_path)
+    dataset_path = dataset_path or (
+        "/data/TimeLens-Bench/charades-timelens-query-samples.json"
+        if modal is not None
+        else get_config_value(config, "paths.dataset_query_samples")
+    )
+
+    scene_path = Path(scene_query_path)
+    if not scene_path.exists():
+        raise FileNotFoundError(f"Scene query file not found: {scene_path}")
+    rows = json.loads(scene_path.read_text(encoding="utf-8"))
+    if not isinstance(rows, list):
+        raise ValueError(f"Expected scene query file to contain a JSON list: {scene_path}")
+
+    manual_rows = _manual_scene_moment_query_rows()
+    rows_by_id = {str(row["query_id"]): dict(row) for row in rows}
+    inserted_or_updated = []
+    for row in manual_rows:
+        rows_by_id[str(row["query_id"])] = dict(row)
+        inserted_or_updated.append(str(row["query_id"]))
+
+    samples = load_query_samples(dataset_path)
+    verified_video_ids = load_verified_video_ids(config)
+    samples = [sample for sample in samples if sample.video_id in verified_video_ids]
+    samples = filter_samples_with_gt_span_keyframes(config, samples)
+    ordered_query_ids = [sample.query_id for sample in samples[:1000]]
+    ordered_rows = []
+    missing_after_patch = []
+    for query_index, query_id in enumerate(ordered_query_ids):
+        row = rows_by_id.get(query_id)
+        if row is None:
+            missing_after_patch.append(query_id)
+            continue
+        row["query_index"] = query_index
+        ordered_rows.append(row)
+
+    ordered_set = set(ordered_query_ids)
+    extras = [row for query_id, row in rows_by_id.items() if query_id not in ordered_set]
+    ordered_rows.extend(extras)
+    scene_path.write_text(json.dumps(ordered_rows, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
+
+    diagnostics_payload: Dict[str, Any] = {}
+    diagnostics_path_obj = Path(diagnostics_path)
+    if diagnostics_path_obj.exists():
+        diagnostics_payload = json.loads(diagnostics_path_obj.read_text(encoding="utf-8"))
+    original_failures = list(diagnostics_payload.get("failures") or [])
+    fixed_ids = set(inserted_or_updated)
+    remaining_failures = [failure for failure in original_failures if str(failure.get("query_id")) not in fixed_ids]
+    diagnostics_payload.update(
+        {
+            "output_path": str(scene_path),
+            "generated_count": len(ordered_rows),
+            "failure_count": len(remaining_failures),
+            "failures": remaining_failures,
+            "manual_fix_count": len(inserted_or_updated),
+            "manual_fixed_query_ids": inserted_or_updated,
+            "missing_after_patch": missing_after_patch,
+        }
+    )
+    diagnostics_path_obj.write_text(
+        json.dumps(diagnostics_payload, indent=2, ensure_ascii=False, default=_json_default),
+        encoding="utf-8",
+    )
+    if modal is not None:
+        volume.commit()
+
+    summary = {
+        "scene_query_path": str(scene_path),
+        "diagnostics_path": str(diagnostics_path_obj),
+        "inserted_or_updated": inserted_or_updated,
+        "total_rows": len(ordered_rows),
+        "remaining_failure_count": len(remaining_failures),
+        "missing_after_patch": missing_after_patch,
+    }
+    return json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default)
+
+
+@app.local_entrypoint(name="patch_scene_moment_first1000_manual_queries_cli")
+def patch_scene_moment_first1000_manual_queries_cli(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    scene_query_path: str = "/data/TimeLens-Bench/charades-timelens-query-samples-scene-moment-first1000.json",
+    diagnostics_path: str = "/data/TimeLens-Bench/charades-timelens-query-samples-scene-moment-first1000.diagnostics.json",
+):
+    print(
+        patch_scene_moment_first1000_manual_queries.remote(
+            config_path=config_path,
+            dataset_path=dataset_path,
+            scene_query_path=scene_query_path,
+            diagnostics_path=diagnostics_path,
+        )
+    )
+
+
 def _zilliz_string(value: str) -> str:
     return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -435,6 +1013,52 @@ def _candidate_preview(candidates: list[Any], limit: int = 5) -> list[Dict[str, 
         }
         for candidate in candidates[:limit]
     ]
+
+
+def _make_candidate_contact_sheet(candidate_images: list[Any], thumb_size: tuple[int, int] = (256, 192), columns: int = 5) -> Any:
+    from PIL import Image, ImageDraw
+
+    columns = max(1, int(columns))
+    rows = max(1, (len(candidate_images) + columns - 1) // columns)
+    sheet = Image.new("RGB", (columns * thumb_size[0], rows * thumb_size[1]), "white")
+    draw = ImageDraw.Draw(sheet)
+    for index, image in enumerate(candidate_images, start=1):
+        tile = image.convert("RGB").resize(thumb_size)
+        x = ((index - 1) % columns) * thumb_size[0]
+        y = ((index - 1) // columns) * thumb_size[1]
+        sheet.paste(tile, (x, y))
+        label = f"{index}"
+        draw.rectangle((x + 6, y + 6, x + 42, y + 36), fill="black")
+        draw.text((x + 16, y + 12), label, fill="white")
+    return sheet
+
+
+def _parse_json_from_text(text: str) -> Dict[str, Any]:
+    import json
+    import re
+
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?", "", cleaned).strip()
+    cleaned = re.sub(r"```$", "", cleaned).strip()
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if not match:
+            raise
+        return json.loads(match.group(0))
+
+
+def _candidate_to_eval_dict(candidate: Any, rank: int) -> Dict[str, Any]:
+    return {
+        "rank": int(rank),
+        "keyframe_id": candidate.keyframe_id,
+        "video_id": candidate.video_id,
+        "shot_id": candidate.shot_id,
+        "timestamp_raw": float(candidate.timestamp_raw),
+        "frame_index_raw": int(candidate.frame_index_raw),
+        "score": float(candidate.score),
+    }
 
 
 def _ranked_videos(video_scores: Dict[str, float]) -> list[Dict[str, Any]]:
@@ -838,6 +1462,7 @@ def diagnose_video_aggregation_strategies(
         samples = samples[:limit]
 
     zilliz = ZillizClient(config)
+    effective_global_depth = min(int(global_depth), int(get_config_value(config, "zilliz.max_search_top_k", 1024)))
     encoders: Dict[str, Any] = {}
     vector_fields: Dict[str, str] = {}
     for model_name in selected_models:
@@ -858,7 +1483,7 @@ def diagnose_video_aggregation_strategies(
         results_by_model: Dict[str, list[Any]] = {}
         for model_name in selected_models:
             vector = encoders[model_name].encode_texts([sample.query_text])[0]
-            results_by_model[model_name] = zilliz.search(vector_fields[model_name], vector, int(global_depth))
+            results_by_model[model_name] = zilliz.search(vector_fields[model_name], vector, effective_global_depth)
 
         ranked_by_strategy = _video_score_strategies(results_by_model)
         query_ranks: Dict[str, int | None] = {}
@@ -924,7 +1549,8 @@ def diagnose_video_aggregation_strategies(
         "vector_fields": vector_fields,
         "require_verified_gt_video": bool(require_verified_gt_video),
         "require_gt_span_keyframe": bool(require_gt_span_keyframe),
-        "global_depth": int(global_depth),
+        "requested_global_depth": int(global_depth),
+        "effective_global_depth": int(effective_global_depth),
         "strategy_summary": strategy_summary,
         "per_query": per_query,
     }
@@ -944,7 +1570,8 @@ def diagnose_video_aggregation_strategies(
     summary = {
         "num_queries": n,
         "model_spaces": selected_models,
-        "global_depth": int(global_depth),
+        "requested_global_depth": int(global_depth),
+        "effective_global_depth": int(effective_global_depth),
         "top_strategies": strategy_summary[:10],
         "output_path": str(output_path_obj),
     }
@@ -973,6 +1600,245 @@ def diagnose_video_aggregation_strategies_cli(
             require_verified_gt_video=require_verified_gt_video,
             require_gt_span_keyframe=require_gt_span_keyframe,
             global_depth=global_depth,
+            output_path=output_path,
+        )
+    )
+
+
+@app.function(gpu="L4", cpu=4, memory=32768, timeout=21600, **function_kwargs)
+def diagnose_gemini_visual_rerank(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    limit: int | None = 10,
+    offset: int = 0,
+    require_verified_gt_video: bool = True,
+    require_gt_span_keyframe: bool = True,
+    global_depth: int = 1024,
+    candidate_videos: int = 10,
+    output_path: str | None = None,
+) -> str:
+    _prepare_runtime()
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from src.eval.metrics import compute_hits
+    from src.eval.run_evaluation import (
+        filter_samples_with_gt_span_keyframes,
+        load_query_samples,
+        load_verified_video_ids,
+    )
+    from src.models.load_beit3 import BEiT3Encoder
+    from src.schemas import RetrievalCandidate
+    from src.storage.zilliz_client import ZillizClient
+    from src.utils.config import get_config_value, load_config
+    from src.utils.video_io import read_frames_by_index
+
+    config_path = _default_config_path(config_path)
+    config = load_config(config_path)
+    dataset_path = dataset_path or (
+        "/data/TimeLens-Bench/charades-timelens-query-samples.json"
+        if modal is not None
+        else get_config_value(config, "paths.dataset_query_samples")
+    )
+    samples = load_query_samples(dataset_path)
+    if require_verified_gt_video:
+        verified_video_ids = load_verified_video_ids(config)
+        samples = [sample for sample in samples if sample.video_id in verified_video_ids]
+    if require_gt_span_keyframe:
+        samples = filter_samples_with_gt_span_keyframes(config, samples)
+    if offset:
+        samples = samples[int(offset) :]
+    if limit is not None:
+        samples = samples[:limit]
+
+    api_key_env = get_config_value(config, "models.gemini.api_key_env", "GEMINI_API_KEY")
+    model_env = get_config_value(config, "models.gemini.model_env", "GEMINI_MODEL")
+    api_key = os.environ.get(api_key_env, "")
+    model_name = os.environ.get(model_env, "")
+    if not api_key or not model_name:
+        raise RuntimeError(f"{api_key_env} and {model_env} must be set.")
+
+    import google.generativeai as genai
+
+    genai.configure(api_key=api_key)
+    gemini_model = genai.GenerativeModel(model_name)
+    zilliz = ZillizClient(config)
+    beit3 = BEiT3Encoder(config).load()
+    effective_global_depth = min(int(global_depth), int(get_config_value(config, "zilliz.max_search_top_k", 1024)))
+    candidate_videos = max(1, min(int(candidate_videos), 20))
+
+    per_query = []
+    baseline_rows = []
+    rerank_rows = []
+    errors = []
+
+    for sample in samples:
+        try:
+            vector = beit3.encode_texts([sample.query_text])[0]
+            global_results = zilliz.search(zilliz.beit3_field, vector, effective_global_depth)
+            grouped = _group_candidates_by_video_for_modal(global_results)
+            ranked_videos = sorted(
+                grouped.items(),
+                key=lambda item: (-_mean_top_k_score_for_modal(item[1], k=3), item[0]),
+            )
+            baseline_candidates = [candidates[0] for _, candidates in ranked_videos[:candidate_videos]]
+
+            candidate_images = []
+            usable_candidates = []
+            for candidate in baseline_candidates:
+                source_path, _ = _resolve_video_path("", candidate.video_id, config)
+                frames = read_frames_by_index(source_path, [candidate.frame_index_raw]) if source_path is not None else []
+                if frames:
+                    usable_candidates.append(candidate)
+                    candidate_images.append(frames[0])
+
+            if not usable_candidates:
+                raise RuntimeError(f"No candidate frames could be read for query_id={sample.query_id}.")
+
+            contact_sheet = _make_candidate_contact_sheet(candidate_images)
+            candidate_lines = [
+                f"{index}. keyframe_id={candidate.keyframe_id}, video_id={candidate.video_id}, timestamp={candidate.timestamp_raw:.3f}"
+                for index, candidate in enumerate(usable_candidates, start=1)
+            ]
+            prompt = (
+                "You are reranking candidate video keyframes for text-to-keyframe retrieval.\n"
+                "Choose the candidates whose visual content best matches the query action, objects, and scene.\n"
+                "The attached contact sheet contains numbered candidate keyframes.\n"
+                "Return valid JSON only in this format: {\"ranking\": [1, 2, 3], \"reason\": \"short reason\"}.\n"
+                "Rank all visible candidate numbers from best to worst. Do not include numbers outside the list.\n\n"
+                f"Query: {sample.query_text}\n\n"
+                "Candidates:\n" + "\n".join(candidate_lines)
+            )
+            response = gemini_model.generate_content([prompt, contact_sheet])
+            payload = _parse_json_from_text(response.text or "{}")
+            ranking = []
+            seen = set()
+            for item in payload.get("ranking", []):
+                try:
+                    number = int(item)
+                except Exception:
+                    continue
+                if 1 <= number <= len(usable_candidates) and number not in seen:
+                    seen.add(number)
+                    ranking.append(number)
+            for number in range(1, len(usable_candidates) + 1):
+                if number not in seen:
+                    ranking.append(number)
+
+            reranked_candidates = [usable_candidates[number - 1] for number in ranking]
+            baseline_ranked = assign_ranks_for_modal(baseline_candidates)
+            reranked = assign_ranks_for_modal(reranked_candidates)
+            baseline_hits = compute_hits(baseline_ranked, sample.video_id, sample.gt_span)
+            rerank_hits = compute_hits(reranked, sample.video_id, sample.gt_span)
+            baseline_rows.append(baseline_hits)
+            rerank_rows.append(rerank_hits)
+            per_query.append(
+                {
+                    "query_id": sample.query_id,
+                    "query_text": sample.query_text,
+                    "gt_video_id": sample.video_id,
+                    "gt_span": sample.gt_span,
+                    "gemini_ranking": ranking,
+                    "gemini_reason": payload.get("reason"),
+                    "baseline_hits": baseline_hits,
+                    "rerank_hits": rerank_hits,
+                    "baseline_candidates": [
+                        _candidate_to_eval_dict(candidate, rank)
+                        for rank, candidate in enumerate(baseline_ranked, start=1)
+                    ],
+                    "reranked_candidates": [
+                        _candidate_to_eval_dict(candidate, rank)
+                        for rank, candidate in enumerate(reranked, start=1)
+                    ],
+                }
+            )
+        except Exception as exc:
+            errors.append({"query_id": sample.query_id, "error": repr(exc)})
+
+    def recall(rows: list[Dict[str, Any]], key: str) -> float:
+        return (sum(1 for row in rows if row.get(key)) / len(samples)) if samples else 0.0
+
+    summary = {
+        "num_queries": len(samples),
+        "evaluated_queries": len(per_query),
+        "errors": len(errors),
+        "global_depth": int(effective_global_depth),
+        "candidate_videos": int(candidate_videos),
+        "baseline": {
+            "recall_at_1": recall(baseline_rows, "hit_at_1"),
+            "recall_at_5": recall(baseline_rows, "hit_at_5"),
+            "recall_at_10": recall(baseline_rows, "hit_at_10"),
+            "video_recall_at_1": recall(baseline_rows, "video_hit_at_1"),
+            "video_recall_at_5": recall(baseline_rows, "video_hit_at_5"),
+            "video_recall_at_10": recall(baseline_rows, "video_hit_at_10"),
+        },
+        "gemini_visual_rerank": {
+            "recall_at_1": recall(rerank_rows, "hit_at_1"),
+            "recall_at_5": recall(rerank_rows, "hit_at_5"),
+            "recall_at_10": recall(rerank_rows, "hit_at_10"),
+            "video_recall_at_1": recall(rerank_rows, "video_hit_at_1"),
+            "video_recall_at_5": recall(rerank_rows, "video_hit_at_5"),
+            "video_recall_at_10": recall(rerank_rows, "video_hit_at_10"),
+        },
+    }
+
+    payload = {**summary, "per_query": per_query, "error_samples": errors[:20]}
+    if output_path is None:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        output_root = Path("/data/outputs/diagnostics" if modal is not None else "outputs/diagnostics")
+        output_path_obj = output_root / f"gemini_visual_rerank_{timestamp}.json"
+    else:
+        output_path_obj = Path(output_path)
+    output_path_obj.parent.mkdir(parents=True, exist_ok=True)
+    output_path_obj.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
+    if modal is not None:
+        volume.commit()
+    summary["output_path"] = str(output_path_obj)
+    return json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default)
+
+
+def _group_candidates_by_video_for_modal(candidates: list[Any]) -> Dict[str, list[Any]]:
+    grouped: Dict[str, list[Any]] = {}
+    for candidate in candidates:
+        grouped.setdefault(candidate.video_id, []).append(candidate)
+    for video_candidates in grouped.values():
+        video_candidates.sort(key=lambda item: (-float(item.score), item.keyframe_id))
+    return grouped
+
+
+def _mean_top_k_score_for_modal(candidates: list[Any], k: int = 3) -> float:
+    scores = sorted((float(candidate.score) for candidate in candidates), reverse=True)[:k]
+    return sum(scores) / len(scores) if scores else float("-inf")
+
+
+def assign_ranks_for_modal(candidates: list[Any]) -> list[Any]:
+    for rank, candidate in enumerate(candidates, start=1):
+        candidate.rank = rank
+    return candidates
+
+
+@app.local_entrypoint(name="diagnose_gemini_visual_rerank_cli")
+def diagnose_gemini_visual_rerank_cli(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    limit: int | None = 10,
+    offset: int = 0,
+    require_verified_gt_video: bool = True,
+    require_gt_span_keyframe: bool = True,
+    global_depth: int = 1024,
+    candidate_videos: int = 10,
+    output_path: str | None = None,
+):
+    print(
+        diagnose_gemini_visual_rerank.remote(
+            config_path=config_path,
+            dataset_path=dataset_path,
+            limit=limit,
+            offset=offset,
+            require_verified_gt_video=require_verified_gt_video,
+            require_gt_span_keyframe=require_gt_span_keyframe,
+            global_depth=global_depth,
+            candidate_videos=candidate_videos,
             output_path=output_path,
         )
     )
@@ -1204,6 +2070,12 @@ def run_online_evaluation(
     require_gt_span_keyframe: bool = False,
     video_aggregation_global_depth: int | None = None,
     video_aggregation_keyframes_per_video: int | None = None,
+    xpool_paperlike_num_frames: int | None = None,
+    xpool_paperlike_keyframes_per_video: int | None = None,
+    xpool_paperlike_batch_size: int | None = None,
+    xpool_paperlike_num_heads: int | None = None,
+    xpool_paperlike_dropout: float | None = None,
+    xpool_paperlike_checkpoint: str | None = None,
 ) -> Dict[str, Any]:
     _prepare_runtime()
     from src.eval.run_evaluation import run_online_evaluation as _run_online_evaluation
@@ -1225,6 +2097,12 @@ def run_online_evaluation(
         require_gt_span_keyframe=require_gt_span_keyframe,
         video_aggregation_global_depth=video_aggregation_global_depth,
         video_aggregation_keyframes_per_video=video_aggregation_keyframes_per_video,
+        xpool_paperlike_num_frames=xpool_paperlike_num_frames,
+        xpool_paperlike_keyframes_per_video=xpool_paperlike_keyframes_per_video,
+        xpool_paperlike_batch_size=xpool_paperlike_batch_size,
+        xpool_paperlike_num_heads=xpool_paperlike_num_heads,
+        xpool_paperlike_dropout=xpool_paperlike_dropout,
+        xpool_paperlike_checkpoint=xpool_paperlike_checkpoint,
     )
 
 
@@ -1253,6 +2131,36 @@ def run_openclip_baseline_evaluation(
         offset=offset,
         latency_mode=latency_mode,
         baseline_openclip_only=True,
+        require_verified_gt_video=require_verified_gt_video,
+        require_gt_span_keyframe=require_gt_span_keyframe,
+    )
+
+
+@app.function(gpu="L4", cpu=4, memory=32768, timeout=21600, **function_kwargs)
+def run_openclip_scene_rewrite_baseline_evaluation(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    output_dir: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    latency_mode: str | None = None,
+    require_verified_gt_video: bool = False,
+    require_gt_span_keyframe: bool = False,
+) -> Dict[str, Any]:
+    _prepare_runtime()
+    from src.eval.run_evaluation import run_online_evaluation as _run_online_evaluation
+
+    config_path = _default_config_path(config_path)
+    dataset_path = dataset_path or ("/data/TimeLens-Bench/charades-timelens-query-samples.json" if modal is not None else None)
+    output_dir = output_dir or ("/data/outputs/eval" if modal is not None else None)
+    return _run_online_evaluation(
+        config_path=config_path,
+        dataset_path=dataset_path,
+        output_dir=output_dir,
+        limit=limit,
+        offset=offset,
+        latency_mode=latency_mode,
+        online_mode="openclip_llm_scene_rewrite_baseline",
         require_verified_gt_video=require_verified_gt_video,
         require_gt_span_keyframe=require_gt_span_keyframe,
     )
@@ -1330,6 +2238,8 @@ def run_video_aggregation_baseline_evaluation(
     require_gt_span_keyframe: bool = False,
     global_depth: int = 1000,
     keyframes_per_video: int = 1,
+    score_strategy: str = "mean_topk",
+    score_top_k: int = 3,
 ) -> Dict[str, Any]:
     _prepare_runtime()
     from src.eval.run_evaluation import run_online_evaluation as _run_online_evaluation
@@ -1349,6 +2259,210 @@ def run_video_aggregation_baseline_evaluation(
         require_gt_span_keyframe=require_gt_span_keyframe,
         video_aggregation_global_depth=global_depth,
         video_aggregation_keyframes_per_video=keyframes_per_video,
+        video_score_strategy=score_strategy,
+        video_score_top_k=score_top_k,
+    )
+
+
+@app.function(gpu="L4", cpu=4, memory=32768, timeout=21600, **function_kwargs)
+def run_window_aggregation_baseline_evaluation(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    output_dir: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    latency_mode: str | None = None,
+    require_verified_gt_video: bool = False,
+    require_gt_span_keyframe: bool = False,
+    global_depth: int = 1000,
+    window_size: float = 8.0,
+    window_stride: float = 4.0,
+    score_strategy: str = "mean_topk",
+    score_top_k: int = 3,
+    keyframes_per_window: int = 1,
+    max_windows_per_video: int = 1,
+) -> Dict[str, Any]:
+    _prepare_runtime()
+    from src.eval.run_evaluation import run_online_evaluation as _run_online_evaluation
+
+    config_path = _default_config_path(config_path)
+    dataset_path = dataset_path or ("/data/TimeLens-Bench/charades-timelens-query-samples.json" if modal is not None else None)
+    output_dir = output_dir or ("/data/outputs/eval" if modal is not None else None)
+    return _run_online_evaluation(
+        config_path=config_path,
+        dataset_path=dataset_path,
+        output_dir=output_dir,
+        limit=limit,
+        offset=offset,
+        latency_mode=latency_mode,
+        online_mode="beit3_window_mean_top3_baseline",
+        require_verified_gt_video=require_verified_gt_video,
+        require_gt_span_keyframe=require_gt_span_keyframe,
+        video_aggregation_global_depth=global_depth,
+        window_size_seconds=window_size,
+        window_stride_seconds=window_stride,
+        window_score_strategy=score_strategy,
+        window_score_top_k=score_top_k,
+        keyframes_per_window=keyframes_per_window,
+        max_windows_per_video=max_windows_per_video,
+    )
+
+
+@app.function(gpu="L4", cpu=4, memory=32768, timeout=21600, **function_kwargs)
+def run_beit3_xpool_softmax_heuristic_evaluation(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    output_dir: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    latency_mode: str | None = None,
+    require_verified_gt_video: bool = False,
+    require_gt_span_keyframe: bool = False,
+    candidate_videos: int = 100,
+    keyframes_per_video: int = 1,
+    temperature: float = 0.07,
+) -> Dict[str, Any]:
+    _prepare_runtime()
+    from src.eval.run_evaluation import run_online_evaluation as _run_online_evaluation
+
+    config_path = _default_config_path(config_path)
+    dataset_path = dataset_path or ("/data/TimeLens-Bench/charades-timelens-query-samples.json" if modal is not None else None)
+    output_dir = output_dir or ("/data/outputs/eval" if modal is not None else None)
+    return _run_online_evaluation(
+        config_path=config_path,
+        dataset_path=dataset_path,
+        output_dir=output_dir,
+        limit=limit,
+        offset=offset,
+        latency_mode=latency_mode,
+        online_mode="beit3_video_xpool_softmax_heuristic_baseline",
+        require_verified_gt_video=require_verified_gt_video,
+        require_gt_span_keyframe=require_gt_span_keyframe,
+        xpool_candidate_videos=candidate_videos,
+        xpool_keyframes_per_video=keyframes_per_video,
+        xpool_temperature=temperature,
+    )
+
+
+@app.function(gpu="L4", cpu=4, memory=32768, timeout=21600, **function_kwargs)
+def run_beit3_xpool_heuristic_evaluation(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    output_dir: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    latency_mode: str | None = None,
+    require_verified_gt_video: bool = False,
+    require_gt_span_keyframe: bool = False,
+    candidate_videos: int = 100,
+    keyframes_per_video: int = 1,
+    temperature: float = 0.07,
+    num_heads: int | None = None,
+    dropout: float | None = None,
+    checkpoint: str | None = None,
+) -> Dict[str, Any]:
+    _prepare_runtime()
+    from src.eval.run_evaluation import run_online_evaluation as _run_online_evaluation
+
+    config_path = _default_config_path(config_path)
+    dataset_path = dataset_path or ("/data/TimeLens-Bench/charades-timelens-query-samples.json" if modal is not None else None)
+    output_dir = output_dir or ("/data/outputs/eval" if modal is not None else None)
+    return _run_online_evaluation(
+        config_path=config_path,
+        dataset_path=dataset_path,
+        output_dir=output_dir,
+        limit=limit,
+        offset=offset,
+        latency_mode=latency_mode,
+        online_mode="beit3_video_xpool_heuristic_baseline",
+        require_verified_gt_video=require_verified_gt_video,
+        require_gt_span_keyframe=require_gt_span_keyframe,
+        xpool_candidate_videos=candidate_videos,
+        xpool_keyframes_per_video=keyframes_per_video,
+        xpool_temperature=temperature,
+        xpool_num_heads=num_heads,
+        xpool_dropout=dropout,
+        xpool_checkpoint=checkpoint,
+    )
+
+
+@app.function(gpu="L4", cpu=4, memory=32768, timeout=21600, **function_kwargs)
+def run_beit3_xpool_paperlike_evaluation(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    output_dir: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    latency_mode: str | None = None,
+    require_verified_gt_video: bool = False,
+    require_gt_span_keyframe: bool = False,
+    num_frames: int = 12,
+    keyframes_per_video: int = 1,
+    batch_size: int = 128,
+    num_heads: int | None = None,
+    dropout: float | None = None,
+    checkpoint: str | None = None,
+) -> Dict[str, Any]:
+    _prepare_runtime()
+    from src.eval.run_evaluation import run_online_evaluation as _run_online_evaluation
+
+    config_path = _default_config_path(config_path)
+    dataset_path = dataset_path or ("/data/TimeLens-Bench/charades-timelens-query-samples.json" if modal is not None else None)
+    output_dir = output_dir or ("/data/outputs/eval" if modal is not None else None)
+    return _run_online_evaluation(
+        config_path=config_path,
+        dataset_path=dataset_path,
+        output_dir=output_dir,
+        limit=limit,
+        offset=offset,
+        latency_mode=latency_mode,
+        online_mode="beit3_video_xpool_paperlike_baseline",
+        require_verified_gt_video=require_verified_gt_video,
+        require_gt_span_keyframe=require_gt_span_keyframe,
+        xpool_paperlike_num_frames=num_frames,
+        xpool_paperlike_keyframes_per_video=keyframes_per_video,
+        xpool_paperlike_batch_size=batch_size,
+        xpool_paperlike_num_heads=num_heads,
+        xpool_paperlike_dropout=dropout,
+        xpool_paperlike_checkpoint=checkpoint,
+    )
+
+
+@app.function(gpu="L4", cpu=4, memory=32768, timeout=21600, **function_kwargs)
+def run_llm_video_aggregation_baseline_evaluation(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    output_dir: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    latency_mode: str | None = None,
+    require_verified_gt_video: bool = False,
+    require_gt_span_keyframe: bool = False,
+    global_depth: int = 1000,
+    keyframes_per_video: int = 1,
+    score_strategy: str = "mean_topk",
+    score_top_k: int = 3,
+) -> Dict[str, Any]:
+    _prepare_runtime()
+    from src.eval.run_evaluation import run_online_evaluation as _run_online_evaluation
+
+    config_path = _default_config_path(config_path)
+    dataset_path = dataset_path or ("/data/TimeLens-Bench/charades-timelens-query-samples.json" if modal is not None else None)
+    output_dir = output_dir or ("/data/outputs/eval" if modal is not None else None)
+    return _run_online_evaluation(
+        config_path=config_path,
+        dataset_path=dataset_path,
+        output_dir=output_dir,
+        limit=limit,
+        offset=offset,
+        latency_mode=latency_mode,
+        online_mode="beit3_llm_video_mean_top3_baseline",
+        require_verified_gt_video=require_verified_gt_video,
+        require_gt_span_keyframe=require_gt_span_keyframe,
+        video_aggregation_global_depth=global_depth,
+        video_aggregation_keyframes_per_video=keyframes_per_video,
+        video_score_strategy=score_strategy,
+        video_score_top_k=score_top_k,
     )
 
 
@@ -1373,3 +2487,77 @@ def search_single_query(
         online_mode=online_mode,
         baseline_openclip_only=baseline_openclip_only,
     )
+
+
+@app.function(gpu="L4", cpu=8, memory=65536, timeout=3600, **function_kwargs)
+def search_single_query_metrics(
+    query: str,
+    gt_video_id: str,
+    gt_start: float = 0.0,
+    gt_end: float = 1e9,
+    config_path: str | None = None,
+    latency_mode: str | None = None,
+    online_mode: str | None = "beit3_video_xpool_heuristic_baseline",
+) -> Dict[str, Any]:
+    _prepare_runtime()
+    from src.eval.metrics import compute_hits
+    from src.online.search_pipeline import SearchPipeline
+    from src.utils.config import load_config
+
+    config_path = _default_config_path(config_path)
+    overrides: Dict[str, Any] = {"object_filter": {"enabled": False}}
+    if online_mode:
+        overrides["online"] = {"mode": online_mode}
+    pipeline = SearchPipeline(load_config(config_path, overrides=overrides))
+    response = pipeline.search(query, latency_mode=latency_mode)
+    hits = compute_hits(response.results, gt_video_id, [gt_start, gt_end])
+    return {
+        "keyframe_recall_at_1": 1.0 if hits["hit_at_1"] else 0.0,
+        "keyframe_recall_at_5": 1.0 if hits["hit_at_5"] else 0.0,
+        "keyframe_recall_at_10": 1.0 if hits["hit_at_10"] else 0.0,
+        "video_recall_at_1": 1.0 if hits["video_hit_at_1"] else 0.0,
+        "video_recall_at_5": 1.0 if hits["video_hit_at_5"] else 0.0,
+        "video_recall_at_10": 1.0 if hits["video_hit_at_10"] else 0.0,
+    }
+
+
+@app.local_entrypoint(name="search_single_query_cli")
+def search_single_query_cli(
+    query: str,
+    config_path: str | None = None,
+    latency_mode: str | None = None,
+    disable_object_filter: bool = False,
+    online_mode: str | None = None,
+    baseline_openclip_only: bool = False,
+):
+    result = search_single_query.remote(
+        query=query,
+        config_path=config_path,
+        latency_mode=latency_mode,
+        disable_object_filter=disable_object_filter,
+        online_mode=online_mode,
+        baseline_openclip_only=baseline_openclip_only,
+    )
+    print(json.dumps(result, indent=2, ensure_ascii=False, default=_json_default))
+
+
+@app.local_entrypoint(name="search_single_query_metrics_cli")
+def search_single_query_metrics_cli(
+    query: str,
+    gt_video_id: str,
+    gt_start: float = 0.0,
+    gt_end: float = 1e9,
+    config_path: str | None = None,
+    latency_mode: str | None = None,
+    online_mode: str | None = "beit3_video_xpool_heuristic_baseline",
+):
+    result = search_single_query_metrics.remote(
+        query=query,
+        gt_video_id=gt_video_id,
+        gt_start=gt_start,
+        gt_end=gt_end,
+        config_path=config_path,
+        latency_mode=latency_mode,
+        online_mode=online_mode,
+    )
+    print(json.dumps(result, indent=2, ensure_ascii=False, default=_json_default))

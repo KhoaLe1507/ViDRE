@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from src.schemas import KeyframeRecord, RetrievalCandidate
 from src.utils.config import get_config_value
@@ -108,6 +108,7 @@ class ZillizClient:
         top_k: int,
         filter_expr: str | None = None,
     ) -> List[RetrievalCandidate]:
+        top_k = max(1, min(int(top_k), int(get_config_value(self.config, "zilliz.max_search_top_k", 1024))))
         output_fields = [
             "keyframe_id",
             "video_id",
@@ -121,7 +122,7 @@ class ZillizClient:
             "collection_name": self.collection_name,
             "data": [[float(x) for x in vector]],
             "anns_field": vector_field,
-            "limit": int(top_k),
+            "limit": top_k,
             "output_fields": output_fields,
         }
         if filter_expr:
@@ -135,6 +136,55 @@ class ZillizClient:
             score = float(hit.get("distance", hit.get("score", 0.0)))
             candidates.append(RetrievalCandidate.from_mapping(entity, score=score, rank=rank))
         return candidates
+
+    def fetch_keyframe_vectors(
+        self,
+        vector_field: str,
+        filter_expr: str | None = None,
+        batch_size: int | None = None,
+    ) -> List[Tuple[RetrievalCandidate, List[float]]]:
+        batch_size = int(batch_size or get_config_value(self.config, "zilliz.query_batch_size", 256))
+        batch_size = max(1, batch_size)
+        output_fields = [
+            "keyframe_id",
+            "video_id",
+            "shot_id",
+            "timestamp_raw",
+            "frame_index_raw",
+            "model_version",
+            "config_version",
+            vector_field,
+        ]
+        pairs: List[Tuple[RetrievalCandidate, List[float]]] = []
+        offset = 0
+        while True:
+            query_kwargs: Dict[str, Any] = {
+                "collection_name": self.collection_name,
+                "output_fields": output_fields,
+                "limit": batch_size,
+                "offset": offset,
+            }
+            if filter_expr is not None:
+                query_kwargs["filter"] = filter_expr
+
+            rows = self.client.query(**query_kwargs)
+            if not rows:
+                break
+            for row in rows:
+                item = dict(row)
+                vector = item.pop(vector_field, None)
+                if vector is None:
+                    continue
+                pairs.append(
+                    (
+                        RetrievalCandidate.from_mapping(item),
+                        [float(x) for x in vector],
+                    )
+                )
+            if len(rows) < batch_size:
+                break
+            offset += batch_size
+        return pairs
 
 
 def create_zilliz_collection(config: Dict[str, Any], drop_existing: bool = False) -> None:
