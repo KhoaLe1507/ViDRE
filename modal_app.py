@@ -56,6 +56,10 @@ else:
     placement_kwargs = {}
     debug_image = None
 
+temporal_generation_function_kwargs = dict(function_kwargs)
+temporal_generation_function_kwargs["cloud"] = "aws"
+temporal_generation_function_kwargs["region"] = ["eu-west-3", "eu-west-1", "eu-west-2"]
+
 
 def _prepare_runtime() -> None:
     if "/root" not in sys.path:
@@ -728,6 +732,411 @@ def generate_scene_moment_queries(
     return json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default)
 
 
+TEMPORAL_QUERY_TYPES: Dict[int, Dict[str, str]] = {
+    1: {
+        "name": "two_consecutive_scenes",
+        "description": "Two different scenes or visual states appear one after the other in the same short moment.",
+    },
+    2: {
+        "name": "multi_scene_sequence",
+        "description": "Three or more scenes or events appear in a specific order in the same moment.",
+    },
+    3: {
+        "name": "central_scene_between_context",
+        "description": "The target moment is best identified by what happens immediately before and after it.",
+    },
+    4: {
+        "name": "immediate_transition",
+        "description": "The second scene appears right after the first with little or no visual gap.",
+    },
+    5: {
+        "name": "simultaneous_events",
+        "description": "Two events happen at the same time or overlap in the same time span.",
+    },
+    6: {
+        "name": "interrupted_scene",
+        "description": "An ongoing scene is interrupted by a new event that changes the action.",
+    },
+}
+
+
+@app.function(cpu=2, memory=2048, timeout=21600, nonpreemptible=True, **temporal_generation_function_kwargs)
+def generate_temporal_scene_moment_queries(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    output_path: str | None = None,
+    target_count: int = 1000,
+    offset: int = 0,
+    max_candidates: int | None = None,
+    frames_in_span: int = 6,
+    context_frames: int = 2,
+    context_window_seconds: float = 3.0,
+    checkpoint_every: int = 5,
+    gemini_timeout_seconds: int = 120,
+    require_verified_gt_video: bool = True,
+    require_gt_span_keyframe: bool = True,
+) -> str:
+    _prepare_runtime()
+    from collections import Counter
+    from pathlib import Path
+
+    from src.eval.run_evaluation import (
+        filter_samples_with_gt_span_keyframes,
+        load_query_samples,
+        load_verified_video_ids,
+    )
+    from src.utils.config import get_config_value, load_config
+    from src.utils.video_io import get_video_metadata, read_frame_map_by_index
+
+    config_path = _default_config_path(config_path)
+    config = load_config(config_path)
+    dataset_path = dataset_path or (
+        "/data/TimeLens-Bench/charades-timelens-query-samples.json"
+        if modal is not None
+        else get_config_value(config, "paths.dataset_query_samples")
+    )
+    output_path = output_path or (
+        "/data/TimeLens-Bench/charades-timelens-query-samples-temporal-scene-moment-first1000.json"
+        if modal is not None
+        else "outputs/query_sets/charades-timelens-query-samples-temporal-scene-moment-first1000.json"
+    )
+    output_path_obj = Path(output_path)
+    diagnostics_path = output_path_obj.with_suffix(".diagnostics.json")
+    rows = []
+    failures = []
+    skipped = []
+    if output_path_obj.exists():
+        loaded_rows = json.loads(output_path_obj.read_text(encoding="utf-8"))
+        if not isinstance(loaded_rows, list):
+            raise ValueError(f"Expected existing output to contain a JSON list: {output_path_obj}")
+        rows = [dict(row) for row in loaded_rows]
+    if diagnostics_path.exists():
+        diagnostics_payload = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+        failures = list(diagnostics_payload.get("failures") or [])
+        skipped = list(diagnostics_payload.get("skipped") or [])
+
+    samples = load_query_samples(dataset_path)
+    if require_verified_gt_video:
+        verified_video_ids = load_verified_video_ids(config)
+        samples = [sample for sample in samples if sample.video_id in verified_video_ids]
+    if require_gt_span_keyframe:
+        samples = filter_samples_with_gt_span_keyframes(config, samples)
+    if offset:
+        samples = samples[int(offset) :]
+    if max_candidates is not None:
+        samples = samples[: int(max_candidates)]
+
+    api_key_env = get_config_value(config, "models.gemini.api_key_env", "GEMINI_API_KEY")
+    model_env = get_config_value(config, "models.gemini.model_env", "GEMINI_MODEL")
+    api_key = os.environ.get(api_key_env, "")
+    model_name = os.environ.get(model_env, "")
+    if not api_key or not model_name:
+        raise RuntimeError(f"{api_key_env} and {model_env} must be set.")
+
+    import google.generativeai as genai
+
+    genai.configure(api_key=api_key)
+    gemini_model = genai.GenerativeModel(model_name)
+    print(
+        "temporal_generation_gemini_ready "
+        f"model={model_name} dataset={dataset_path} output={output_path_obj} "
+        f"existing_rows={len(rows)} existing_failures={len(failures)} existing_skipped={len(skipped)} "
+        f"samples_after_filter={len(samples)}",
+        flush=True,
+    )
+
+    target_count = max(1, int(target_count))
+    checkpoint_every = max(1, int(checkpoint_every))
+    gemini_timeout_seconds = max(10, int(gemini_timeout_seconds))
+    type_counts: Counter[str] = Counter()
+    for row in rows:
+        type_name = str(row.get("temporal_query_type") or "")
+        if type_name:
+            type_counts[type_name] += 1
+    processed_query_ids = {str(row.get("query_id")) for row in rows if row.get("query_id")}
+    processed_query_ids.update(str(row.get("query_id")) for row in skipped if row.get("query_id"))
+    taxonomy_text = json.dumps(TEMPORAL_QUERY_TYPES, ensure_ascii=False, indent=2)
+
+    def write_progress() -> tuple[Dict[str, int], Dict[str, Any]]:
+        output_path_obj.parent.mkdir(parents=True, exist_ok=True)
+        output_path_obj.write_text(json.dumps(rows, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
+        type_counts_by_id = {
+            str(type_id): int(type_counts[TEMPORAL_QUERY_TYPES[type_id]["name"]])
+            for type_id in sorted(TEMPORAL_QUERY_TYPES)
+        }
+        diagnostics_payload = {
+            "source_dataset_path": str(dataset_path),
+            "output_path": str(output_path_obj),
+            "requested_target_count": target_count,
+            "generated_count": len(rows),
+            "processed_candidate_count": len(rows) + len(skipped) + len(failures),
+            "failure_count": len(failures),
+            "skipped_count": len(skipped),
+            "temporal_query_types": TEMPORAL_QUERY_TYPES,
+            "temporal_type_counts": dict(type_counts),
+            "temporal_type_counts_by_id": type_counts_by_id,
+            "failures": failures[:200],
+            "skipped": skipped[:200],
+            "offset": int(offset),
+            "max_candidates": max_candidates,
+            "frames_in_span": int(frames_in_span),
+            "context_frames": int(context_frames),
+            "context_window_seconds": float(context_window_seconds),
+            "checkpoint_every": checkpoint_every,
+            "gemini_timeout_seconds": gemini_timeout_seconds,
+            "require_verified_gt_video": bool(require_verified_gt_video),
+            "require_gt_span_keyframe": bool(require_gt_span_keyframe),
+        }
+        diagnostics_path.write_text(
+            json.dumps(diagnostics_payload, indent=2, ensure_ascii=False, default=_json_default),
+            encoding="utf-8",
+        )
+        if modal is not None:
+            volume.commit()
+        return type_counts_by_id, diagnostics_payload
+
+    if len(rows) >= target_count:
+        type_counts_by_id, _ = write_progress()
+        summary = {
+            "output_path": str(output_path_obj),
+            "diagnostics_path": str(diagnostics_path),
+            "generated_count": len(rows),
+            "failure_count": len(failures),
+            "skipped_count": len(skipped),
+            "temporal_type_counts_by_id": type_counts_by_id,
+            "temporal_type_counts": dict(type_counts),
+            "preview": rows[:5],
+            "resume_status": "already_complete",
+        }
+        return json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default)
+
+    for source_index, sample in enumerate(samples, start=1 + int(offset)):
+        if len(rows) >= target_count:
+            break
+        if sample.query_id in processed_query_ids:
+            continue
+        try:
+            print(
+                "temporal_generation_sample_start "
+                f"source_index={source_index} generated={len(rows)}/{target_count} "
+                f"skipped={len(skipped)} failures={len(failures)} "
+                f"query_id={sample.query_id} video_id={sample.video_id}",
+                flush=True,
+            )
+            source_path, checked_paths = _resolve_video_path("", sample.video_id, config)
+            if source_path is None:
+                raise RuntimeError(f"Cannot resolve video path for {sample.video_id}: {checked_paths}")
+            metadata = get_video_metadata(source_path)
+            fps = float(metadata["fps_raw"] or 0.0)
+            duration = float(metadata["duration_raw"] or sample.duration or 0.0)
+            frame_groups = _sample_temporal_context_frame_indices(
+                sample.gt_span,
+                fps=fps,
+                duration=duration,
+                frames_in_span=frames_in_span,
+                context_frames=context_frames,
+                context_window_seconds=context_window_seconds,
+            )
+            all_frame_indices = frame_groups["all"]
+            frame_map = read_frame_map_by_index(source_path, all_frame_indices)
+            available_indices = [index for index in all_frame_indices if index in frame_map]
+            if len(available_indices) < 2:
+                raise RuntimeError(f"Cannot read enough sampled frames for {sample.query_id}: {all_frame_indices}")
+            frames = [frame_map[index] for index in available_indices]
+            contact_sheet = _make_candidate_contact_sheet(frames, thumb_size=(256, 192), columns=min(len(frames), 5))
+            available_groups = {
+                group_name: [index for index in indices if index in frame_map]
+                for group_name, indices in frame_groups.items()
+                if group_name != "all"
+            }
+            prompt = (
+                "You are creating an English benchmark query for temporal-relation video/keyframe retrieval.\n"
+                "You are given sampled frames in chronological order from the target ground-truth moment, with a small "
+                "amount of before/after context when available.\n\n"
+                "Your job:\n"
+                "1. Inspect the visible sequence carefully.\n"
+                "2. Choose the single most suitable temporal query type from this taxonomy, only if the frames support it.\n"
+                "3. Write one natural English query that describes the scene/moment with an explicit temporal relation "
+                "such as before, after, then, while, during, immediately after, or interrupted by.\n"
+                "4. Keep the query visually grounded, specific, and useful for retrieval, about 25-45 words.\n\n"
+                "Do not invent people, objects, places, colors, or events that are not visible or strongly implied.\n"
+                "Do not mention frame numbers, timestamps, dataset names, or that you are looking at images.\n"
+                "If the sampled moment does not contain a clear temporal relation, return applicable=false.\n\n"
+                f"Temporal query taxonomy:\n{taxonomy_text}\n\n"
+                "Return valid JSON only in this format:\n"
+                "{\n"
+                '  "applicable": true,\n'
+                '  "temporal_query_type_id": 1,\n'
+                '  "temporal_query": "...",\n'
+                '  "temporal_relation_summary": "...",\n'
+                '  "visible_cues": ["...", "..."]\n'
+                "}\n\n"
+                f"Original action query: {sample.query_text}\n"
+                f"Video id: {sample.video_id}\n"
+                f"Ground-truth span: {sample.gt_span[0]} to {sample.gt_span[1]} seconds\n"
+                f"Frame groups: {json.dumps(available_groups, ensure_ascii=False)}\n"
+                "The contact sheet frames are ordered left-to-right, top-to-bottom in chronological order.\n"
+            )
+            print(
+                "temporal_generation_gemini_request "
+                f"query_id={sample.query_id} frames={len(available_indices)} timeout={gemini_timeout_seconds}",
+                flush=True,
+            )
+            response = gemini_model.generate_content(
+                [prompt, contact_sheet],
+                request_options={"timeout": gemini_timeout_seconds},
+            )
+            print(f"temporal_generation_gemini_response query_id={sample.query_id}", flush=True)
+            payload = _parse_json_from_text(response.text or "{}")
+            if not bool(payload.get("applicable", False)):
+                skipped.append(
+                    {
+                        "query_id": sample.query_id,
+                        "video_id": sample.video_id,
+                        "original_query": sample.query_text,
+                        "reason": "no_clear_temporal_relation",
+                    }
+                )
+                processed_query_ids.add(sample.query_id)
+                if (len(rows) + len(skipped) + len(failures)) % checkpoint_every == 0:
+                    write_progress()
+                    print(
+                        "temporal_generation_checkpoint "
+                        f"generated={len(rows)} skipped={len(skipped)} failures={len(failures)}",
+                        flush=True,
+                    )
+                continue
+            type_id = int(payload.get("temporal_query_type_id"))
+            if type_id not in TEMPORAL_QUERY_TYPES:
+                raise RuntimeError(f"Unsupported temporal_query_type_id={type_id!r} for {sample.query_id}")
+            temporal_query = str(payload.get("temporal_query") or "").strip()
+            if not temporal_query:
+                raise RuntimeError(f"Gemini returned empty temporal_query for {sample.query_id}")
+            type_name = TEMPORAL_QUERY_TYPES[type_id]["name"]
+            rows.append(
+                {
+                    "query_id": sample.query_id,
+                    "video_id": sample.video_id,
+                    "query_index": len(rows),
+                    "source_query_index": source_index - 1,
+                    "duration": sample.duration,
+                    "query": temporal_query,
+                    "query_text": temporal_query,
+                    "span": sample.gt_span,
+                    "gt_span": sample.gt_span,
+                    "original_query": sample.query_text,
+                    "query_style": "temporal_scene_moment_event",
+                    "temporal_query_type_id": type_id,
+                    "temporal_query_type": type_name,
+                    "temporal_relation_summary": str(payload.get("temporal_relation_summary") or "").strip(),
+                    "generation_model": model_name,
+                    "sampled_frame_indices": available_indices,
+                    "sampled_frame_groups": available_groups,
+                    "visible_cues": payload.get("visible_cues") or [],
+                }
+            )
+            type_counts[type_name] += 1
+            processed_query_ids.add(sample.query_id)
+            print(
+                "temporal_generation_sample_done "
+                f"query_id={sample.query_id} type_id={type_id} type={type_name} generated={len(rows)}",
+                flush=True,
+            )
+            if (len(rows) + len(skipped) + len(failures)) % checkpoint_every == 0:
+                write_progress()
+                print(
+                    "temporal_generation_checkpoint "
+                    f"generated={len(rows)} skipped={len(skipped)} failures={len(failures)}",
+                    flush=True,
+                )
+        except Exception as exc:
+            failures.append(
+                {
+                    "query_id": sample.query_id,
+                    "video_id": sample.video_id,
+                    "original_query": sample.query_text,
+                    "error": repr(exc),
+                }
+            )
+            processed_query_ids.add(sample.query_id)
+            print(
+                "temporal_generation_sample_failed "
+                f"query_id={sample.query_id} error={repr(exc)} generated={len(rows)} "
+                f"skipped={len(skipped)} failures={len(failures)}",
+                flush=True,
+            )
+            if (len(rows) + len(skipped) + len(failures)) % checkpoint_every == 0:
+                write_progress()
+                print(
+                    "temporal_generation_checkpoint "
+                    f"generated={len(rows)} skipped={len(skipped)} failures={len(failures)}",
+                    flush=True,
+                )
+
+    type_counts_by_id, _ = write_progress()
+
+    summary = {
+        "output_path": str(output_path_obj),
+        "diagnostics_path": str(diagnostics_path),
+        "generated_count": len(rows),
+        "failure_count": len(failures),
+        "skipped_count": len(skipped),
+        "temporal_type_counts_by_id": type_counts_by_id,
+        "temporal_type_counts": dict(type_counts),
+        "preview": rows[:5],
+    }
+    return json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default)
+
+
+def _sample_temporal_context_frame_indices(
+    gt_span: list[float],
+    fps: float,
+    duration: float,
+    frames_in_span: int,
+    context_frames: int,
+    context_window_seconds: float,
+) -> Dict[str, list[int]]:
+    if fps <= 0.0:
+        return {"before": [], "in_span": [], "after": [], "all": []}
+    start = max(0.0, float(gt_span[0]))
+    end = min(float(duration), max(start, float(gt_span[1])))
+    if end <= start:
+        end = min(float(duration), start + 1.0)
+    context_window_seconds = max(0.0, float(context_window_seconds))
+    before_start = max(0.0, start - context_window_seconds)
+    after_end = min(float(duration), end + context_window_seconds)
+    before = _sample_frame_indices_for_interval(before_start, start, fps, duration, context_frames, include_end=False)
+    in_span = _sample_frame_indices_for_interval(start, end, fps, duration, frames_in_span, include_end=True)
+    after = _sample_frame_indices_for_interval(end, after_end, fps, duration, context_frames, include_end=True)
+    after = [index for index in after if index not in set(in_span)]
+    all_indices = sorted(dict.fromkeys(before + in_span + after))
+    return {"before": before, "in_span": in_span, "after": after, "all": all_indices}
+
+
+def _sample_frame_indices_for_interval(
+    start: float,
+    end: float,
+    fps: float,
+    duration: float,
+    count: int,
+    include_end: bool,
+) -> list[int]:
+    count = max(0, int(count))
+    if count == 0 or fps <= 0.0 or duration <= 0.0:
+        return []
+    start = max(0.0, min(float(duration), float(start)))
+    end = max(0.0, min(float(duration), float(end)))
+    if end <= start:
+        return []
+    if count == 1:
+        times = [(start + end) / 2.0]
+    else:
+        denominator = float(count - 1) if include_end else float(count)
+        times = [start + ((end - start) * position / denominator) for position in range(count)]
+    max_frame_index = max(0, int(round(float(duration) * fps)) - 1)
+    return sorted({max(0, min(max_frame_index, int(round(time_sec * fps)))) for time_sec in times})
+
+
 def _sample_frame_indices_for_span(
     gt_span: list[float],
     fps: float,
@@ -774,6 +1183,41 @@ def generate_scene_moment_queries_cli(
             limit=limit,
             offset=offset,
             frames_per_query=frames_per_query,
+            require_verified_gt_video=require_verified_gt_video,
+            require_gt_span_keyframe=require_gt_span_keyframe,
+        )
+    )
+
+
+@app.local_entrypoint(name="generate_temporal_scene_moment_queries_cli")
+def generate_temporal_scene_moment_queries_cli(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    output_path: str | None = None,
+    target_count: int = 1000,
+    offset: int = 0,
+    max_candidates: int | None = None,
+    frames_in_span: int = 6,
+    context_frames: int = 2,
+    context_window_seconds: float = 3.0,
+    checkpoint_every: int = 5,
+    gemini_timeout_seconds: int = 120,
+    require_verified_gt_video: bool = True,
+    require_gt_span_keyframe: bool = True,
+):
+    print(
+        generate_temporal_scene_moment_queries.remote(
+            config_path=config_path,
+            dataset_path=dataset_path,
+            output_path=output_path,
+            target_count=target_count,
+            offset=offset,
+            max_candidates=max_candidates,
+            frames_in_span=frames_in_span,
+            context_frames=context_frames,
+            context_window_seconds=context_window_seconds,
+            checkpoint_every=checkpoint_every,
+            gemini_timeout_seconds=gemini_timeout_seconds,
             require_verified_gt_video=require_verified_gt_video,
             require_gt_span_keyframe=require_gt_span_keyframe,
         )
@@ -2104,6 +2548,193 @@ def run_online_evaluation(
         xpool_paperlike_dropout=xpool_paperlike_dropout,
         xpool_paperlike_checkpoint=xpool_paperlike_checkpoint,
     )
+
+
+@app.function(gpu="L4", cpu=4, memory=32768, timeout=21600, **function_kwargs)
+def run_fusionista_temporal_evaluation(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    output_dir: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    output_depth: int = 10,
+    llm_timeout_seconds: int = 90,
+    checkpoint_every: int = 10,
+    max_subqueries: int = 4,
+) -> Dict[str, Any]:
+    _prepare_runtime()
+    from src.online.temporal_solutions import run_temporal_solution_evaluation
+
+    config_path = _default_config_path(config_path)
+    dataset_path = dataset_path or "/data/TimeLens-Bench/charades-timelens-query-samples-temporal-scene-moment-first1000.json"
+    output_dir = output_dir or "/data/outputs/eval"
+    result = run_temporal_solution_evaluation(
+        solution="fusionista",
+        config_path=config_path,
+        dataset_path=dataset_path,
+        output_dir=output_dir,
+        limit=limit,
+        offset=offset,
+        output_depth=output_depth,
+        llm_timeout_seconds=llm_timeout_seconds,
+        checkpoint_every=checkpoint_every,
+        max_subqueries=max_subqueries,
+    )
+    if modal is not None:
+        volume.commit()
+    return result
+
+
+@app.function(gpu="L4", cpu=4, memory=32768, timeout=21600, **function_kwargs)
+def run_exquisitor_temporal_evaluation(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    output_dir: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    output_depth: int = 10,
+    llm_timeout_seconds: int = 90,
+    checkpoint_every: int = 10,
+    max_subqueries: int = 4,
+    initial_depth: int = 1000,
+) -> Dict[str, Any]:
+    _prepare_runtime()
+    from src.online.temporal_solutions import run_temporal_solution_evaluation
+
+    config_path = _default_config_path(config_path)
+    dataset_path = dataset_path or "/data/TimeLens-Bench/charades-timelens-query-samples-temporal-scene-moment-first1000.json"
+    output_dir = output_dir or "/data/outputs/eval"
+    result = run_temporal_solution_evaluation(
+        solution="exquisitor",
+        config_path=config_path,
+        dataset_path=dataset_path,
+        output_dir=output_dir,
+        limit=limit,
+        offset=offset,
+        output_depth=output_depth,
+        llm_timeout_seconds=llm_timeout_seconds,
+        checkpoint_every=checkpoint_every,
+        max_subqueries=max_subqueries,
+        exquisitor_initial_depth=initial_depth,
+    )
+    if modal is not None:
+        volume.commit()
+    return result
+
+
+@app.function(gpu="L4", cpu=4, memory=32768, timeout=21600, **function_kwargs)
+def run_viewsinsight_temporal_evaluation(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    output_dir: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    output_depth: int = 10,
+    llm_timeout_seconds: int = 90,
+    checkpoint_every: int = 10,
+    max_subqueries: int = 4,
+) -> Dict[str, Any]:
+    _prepare_runtime()
+    from src.online.temporal_solutions import run_temporal_solution_evaluation
+
+    config_path = _default_config_path(config_path)
+    dataset_path = dataset_path or "/data/TimeLens-Bench/charades-timelens-query-samples-temporal-scene-moment-first1000.json"
+    output_dir = output_dir or "/data/outputs/eval"
+    result = run_temporal_solution_evaluation(
+        solution="viewsinsight",
+        config_path=config_path,
+        dataset_path=dataset_path,
+        output_dir=output_dir,
+        limit=limit,
+        offset=offset,
+        output_depth=output_depth,
+        llm_timeout_seconds=llm_timeout_seconds,
+        checkpoint_every=checkpoint_every,
+        max_subqueries=max_subqueries,
+    )
+    if modal is not None:
+        volume.commit()
+    return result
+
+
+@app.local_entrypoint(name="run_fusionista_temporal_evaluation_cli")
+def run_fusionista_temporal_evaluation_cli(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    output_dir: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    output_depth: int = 10,
+    llm_timeout_seconds: int = 90,
+    checkpoint_every: int = 10,
+    max_subqueries: int = 4,
+):
+    result = run_fusionista_temporal_evaluation.remote(
+        config_path=config_path,
+        dataset_path=dataset_path,
+        output_dir=output_dir,
+        limit=limit,
+        offset=offset,
+        output_depth=output_depth,
+        llm_timeout_seconds=llm_timeout_seconds,
+        checkpoint_every=checkpoint_every,
+        max_subqueries=max_subqueries,
+    )
+    print(json.dumps(result, indent=2, ensure_ascii=False, default=_json_default))
+
+
+@app.local_entrypoint(name="run_exquisitor_temporal_evaluation_cli")
+def run_exquisitor_temporal_evaluation_cli(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    output_dir: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    output_depth: int = 10,
+    llm_timeout_seconds: int = 90,
+    checkpoint_every: int = 10,
+    max_subqueries: int = 4,
+    initial_depth: int = 1000,
+):
+    result = run_exquisitor_temporal_evaluation.remote(
+        config_path=config_path,
+        dataset_path=dataset_path,
+        output_dir=output_dir,
+        limit=limit,
+        offset=offset,
+        output_depth=output_depth,
+        llm_timeout_seconds=llm_timeout_seconds,
+        checkpoint_every=checkpoint_every,
+        max_subqueries=max_subqueries,
+        initial_depth=initial_depth,
+    )
+    print(json.dumps(result, indent=2, ensure_ascii=False, default=_json_default))
+
+
+@app.local_entrypoint(name="run_viewsinsight_temporal_evaluation_cli")
+def run_viewsinsight_temporal_evaluation_cli(
+    config_path: str | None = None,
+    dataset_path: str | None = None,
+    output_dir: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    output_depth: int = 10,
+    llm_timeout_seconds: int = 90,
+    checkpoint_every: int = 10,
+    max_subqueries: int = 4,
+):
+    result = run_viewsinsight_temporal_evaluation.remote(
+        config_path=config_path,
+        dataset_path=dataset_path,
+        output_dir=output_dir,
+        limit=limit,
+        offset=offset,
+        output_depth=output_depth,
+        llm_timeout_seconds=llm_timeout_seconds,
+        checkpoint_every=checkpoint_every,
+        max_subqueries=max_subqueries,
+    )
+    print(json.dumps(result, indent=2, ensure_ascii=False, default=_json_default))
 
 
 @app.function(gpu="L4", cpu=4, memory=32768, timeout=21600, **function_kwargs)
