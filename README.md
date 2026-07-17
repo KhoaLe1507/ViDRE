@@ -164,7 +164,6 @@ same short action phrase but only one is labeled as ground truth.
 
 | Setting | Queries | Keyframe R@1 | Keyframe R@5 | Keyframe R@10 | Video R@1 | Video R@5 | Video R@10 | Latency |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| OpenCLIP direct baseline on scene/moment queries | 1,000 | 0.404 | 0.694 | 0.783 | 0.584 | 0.821 | 0.897 | 42 ms |
 | BEiT-3 query-conditioned video-first on scene/moment queries | 1,000 | 0.327 | 0.512 | 0.568 | 0.485 | 0.758 | 0.852 | 831 ms |
 
 ## Repository Structure
