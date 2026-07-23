@@ -57,7 +57,7 @@ static keyframes.
 
 Current processed scale:
 
-- Videos: about 1,014 verified videos
+- Videos: about 1,000 verified videos
 - Keyframes: about 6.3K indexed keyframes
 - Original action queries: 2,594 queries
 - Scene/moment query subset: 1,000 rewritten queries used for diagnostic
